@@ -159,7 +159,7 @@ impl LogStore {
         let inner = self.inner.lock().expect("logs poisoned");
         let total = inner.total_for_level(level);
         let offset = offset.min(total);
-        let limit = limit.clamp(1, MAX_LOG_PAGE_LIMIT);
+        let limit = limit.min(MAX_LOG_PAGE_LIMIT);
         let end = offset.saturating_add(limit).min(total);
         let entries = inner.page(level, offset, end);
 
@@ -396,6 +396,19 @@ mod tests {
         assert_eq!(page.entries[0].summary, "one");
         assert!(page.entries[0].has_detail);
         assert_eq!(page.entries[1].summary, "three");
+    }
+
+    #[test]
+    fn zero_limit_returns_empty_page() {
+        let store = LogStore::default();
+        store.push(LogLevel::Info, "api", None, None, "one", None);
+
+        let page = store.page(None, 0, 0);
+
+        assert_eq!(page.total, 1);
+        assert_eq!(page.offset, 0);
+        assert_eq!(page.limit, 0);
+        assert!(page.entries.is_empty());
     }
 
     #[test]

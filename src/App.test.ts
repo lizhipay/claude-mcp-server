@@ -35,6 +35,18 @@ describe("log utilities", () => {
     expect(window.totalHeight).toBe(42_000_000);
   });
 
+  it("keeps virtual page values non-negative after filtering or resize changes", () => {
+    const window = getVirtualLogWindow(42 * 500, -20_132, 100);
+    expect(window.offset).toBe(100);
+    expect(window.limit).toBe(0);
+    expect(window.translateY).toBe(4_200);
+  });
+
+  it("ignores non-finite virtual list inputs", () => {
+    const window = getVirtualLogWindow(Number.NaN, Number.NaN, Number.NaN);
+    expect(window).toEqual({ offset: 0, limit: 0, translateY: 0, totalHeight: 0 });
+  });
+
   it("formats detail lazily with truncation", () => {
     expect(formatLogDetail({ ok: true })).toContain('"ok": true');
     expect(formatLogDetail("abcdef", 3)).toContain("已截断显示");

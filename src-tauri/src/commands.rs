@@ -86,9 +86,11 @@ pub async fn get_log_stats(state: State<'_, AppState>) -> Result<LogStats, Strin
 pub async fn get_log_page(
     state: State<'_, AppState>,
     level: Option<LogLevel>,
-    offset: usize,
-    limit: usize,
+    offset: isize,
+    limit: isize,
 ) -> Result<LogPage, String> {
+    let offset = usize::try_from(offset).unwrap_or(0);
+    let limit = usize::try_from(limit).unwrap_or(0);
     Ok(state.logs().page(level, offset, limit))
 }
 

@@ -18,19 +18,32 @@ export function getVirtualLogWindow(
   rowHeight = LOG_ROW_HEIGHT,
   overscan = LOG_OVERSCAN_ROWS,
 ) {
-  if (total <= 0) {
+  const safeTotal = Math.max(0, Math.floor(Number.isFinite(total) ? total : 0));
+  const safeRowHeight =
+    Number.isFinite(rowHeight) && rowHeight > 0 ? rowHeight : LOG_ROW_HEIGHT;
+  const safeOverscan = Math.max(0, Math.floor(Number.isFinite(overscan) ? overscan : 0));
+  const safeScrollTop = Math.max(0, Number.isFinite(scrollTop) ? scrollTop : 0);
+  const safeViewportHeight = Math.max(0, Number.isFinite(viewportHeight) ? viewportHeight : 0);
+
+  if (safeTotal <= 0) {
     return { offset: 0, limit: 0, translateY: 0, totalHeight: 0 };
   }
 
-  const visibleRows = Math.max(1, Math.ceil(Math.max(viewportHeight, rowHeight) / rowHeight));
-  const offset = Math.max(0, Math.floor(Math.max(0, scrollTop) / rowHeight) - overscan);
-  const limit = Math.min(total - offset, visibleRows + overscan * 2);
+  const visibleRows = Math.max(
+    1,
+    Math.ceil(Math.max(safeViewportHeight, safeRowHeight) / safeRowHeight),
+  );
+  const offset = Math.min(
+    safeTotal,
+    Math.max(0, Math.floor(safeScrollTop / safeRowHeight) - safeOverscan),
+  );
+  const limit = Math.max(0, Math.min(safeTotal - offset, visibleRows + safeOverscan * 2));
 
   return {
     offset,
     limit,
-    translateY: offset * rowHeight,
-    totalHeight: total * rowHeight,
+    translateY: offset * safeRowHeight,
+    totalHeight: safeTotal * safeRowHeight,
   };
 }
 

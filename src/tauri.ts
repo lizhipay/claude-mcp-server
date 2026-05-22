@@ -139,6 +139,10 @@ const emptyLogPage: LogPage = {
   latest_id: null,
 };
 
+function toPageNumber(value: number): number {
+  return Math.max(0, Math.floor(Number.isFinite(value) ? value : 0));
+}
+
 function isTauriRuntime(): boolean {
   return typeof window !== "undefined" && "__TAURI_INTERNALS__" in window;
 }
@@ -165,7 +169,11 @@ export const api = {
   getStatus: () => invoke<ServerStatus>("get_server_status", undefined, () => mockStatus),
   getLogStats: () => invoke<LogStats>("get_log_stats", undefined, () => emptyLogStats),
   getLogPage: (level: LogLevel | null, offset: number, limit: number) =>
-    invoke<LogPage>("get_log_page", { level, offset, limit }, () => emptyLogPage),
+    invoke<LogPage>(
+      "get_log_page",
+      { level, offset: toPageNumber(offset), limit: toPageNumber(limit) },
+      () => emptyLogPage,
+    ),
   getLogDetail: (id: number) =>
     invoke<LogEntry>(
       "get_log_detail",
