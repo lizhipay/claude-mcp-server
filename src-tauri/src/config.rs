@@ -7,8 +7,8 @@ use directories::ProjectDirs;
 use serde::{Deserialize, Serialize};
 
 const DEFAULT_API_URL: &str = "https://api.anthropic.com";
-const DEFAULT_MODEL: &str = "claude-sonnet-4-7";
-const LEGACY_DEFAULT_MODEL: &str = "claude-sonnet-4-6";
+const DEFAULT_MODEL: &str = "claude-opus-4-7";
+const LEGACY_DEFAULT_MODELS: &[&str] = &["claude-sonnet-4-7", "claude-sonnet-4-6"];
 const DEFAULT_PORT: u16 = 8765;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -99,7 +99,7 @@ fn load_config_file_from(path: &Path) -> ConfigFile {
         .ok()
         .and_then(|raw| serde_json::from_str::<ConfigFile>(&raw).ok())
         .unwrap_or_default();
-    if file.model == LEGACY_DEFAULT_MODEL {
+    if LEGACY_DEFAULT_MODELS.contains(&file.model.as_str()) {
         file.model = DEFAULT_MODEL.to_string();
     }
     file
@@ -209,6 +209,31 @@ mod tests {
     }
 
     #[test]
+    fn default_model_is_opus() {
+        assert_eq!(ConfigFile::default().model, "claude-opus-4-7");
+    }
+
+    #[test]
+    fn migrates_legacy_default_models_to_opus() {
+        for legacy_model in LEGACY_DEFAULT_MODELS {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("config.json");
+            write_config_file(
+                &path,
+                &ConfigFile {
+                    api_url: "https://example.com".to_string(),
+                    model: legacy_model.to_string(),
+                    port: 8765,
+                    api_key: None,
+                },
+            )
+            .unwrap();
+
+            assert_eq!(load_config_file_from(&path).model, "claude-opus-4-7");
+        }
+    }
+
+    #[test]
     fn rejects_tiny_port() {
         assert!(validate_port(80).is_err());
     }
@@ -222,7 +247,7 @@ mod tests {
             SaveConfigPayload {
                 api_url: "https://example.com".to_string(),
                 api_key: Some("sk-local-secret".to_string()),
-                model: "claude-sonnet-4-7".to_string(),
+                model: "claude-opus-4-7".to_string(),
                 port: 8765,
             },
             &path,
@@ -247,7 +272,7 @@ mod tests {
             SaveConfigPayload {
                 api_url: "https://example.com".to_string(),
                 api_key: Some("sk-existing".to_string()),
-                model: "claude-sonnet-4-7".to_string(),
+                model: "claude-opus-4-7".to_string(),
                 port: 8765,
             },
             &path,
@@ -257,7 +282,7 @@ mod tests {
             SaveConfigPayload {
                 api_url: "https://example.org".to_string(),
                 api_key: Some("  ".to_string()),
-                model: "claude-sonnet-4-7".to_string(),
+                model: "claude-opus-4-7".to_string(),
                 port: 8766,
             },
             &path,
@@ -287,7 +312,7 @@ mod tests {
             &path,
             &ConfigFile {
                 api_url: "https://example.com".to_string(),
-                model: "claude-sonnet-4-7".to_string(),
+                model: "claude-opus-4-7".to_string(),
                 port: 8765,
                 api_key: Some("sk-permission".to_string()),
             },

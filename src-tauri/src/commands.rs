@@ -1,4 +1,4 @@
-use tauri::State;
+use tauri::{AppHandle, State};
 
 use crate::{
     claude, config,
@@ -25,23 +25,51 @@ pub async fn test_api_connection(state: State<'_, AppState>) -> Result<String, S
 }
 
 #[tauri::command]
-pub async fn start_mcp_server(state: State<'_, AppState>) -> Result<ServerStatus, String> {
+pub async fn start_mcp_server(
+    app: AppHandle,
+    state: State<'_, AppState>,
+) -> Result<ServerStatus, String> {
     let cfg = config::load_config();
     config::require_api_key().map_err(to_message)?;
-    state
+    let result = state
         .server()
         .start(state.inner().clone(), cfg)
         .await
-        .map_err(to_message)
+        .map_err(to_message);
+    match result {
+        Ok(status) => {
+            crate::tray::publish_server_status(&app, &status);
+            Ok(status)
+        }
+        Err(error) => {
+            let status = state.server().status().await;
+            crate::tray::publish_server_status(&app, &status);
+            Err(error)
+        }
+    }
 }
 
 #[tauri::command]
-pub async fn stop_mcp_server(state: State<'_, AppState>) -> Result<ServerStatus, String> {
-    state
+pub async fn stop_mcp_server(
+    app: AppHandle,
+    state: State<'_, AppState>,
+) -> Result<ServerStatus, String> {
+    let result = state
         .server()
         .stop(state.inner().clone())
         .await
-        .map_err(to_message)
+        .map_err(to_message);
+    match result {
+        Ok(status) => {
+            crate::tray::publish_server_status(&app, &status);
+            Ok(status)
+        }
+        Err(error) => {
+            let status = state.server().status().await;
+            crate::tray::publish_server_status(&app, &status);
+            Err(error)
+        }
+    }
 }
 
 #[tauri::command]

@@ -39,7 +39,7 @@ import { api } from "./tauri";
 
 const defaultConfig: AppConfig = {
   api_url: "https://api.anthropic.com",
-  model: "claude-sonnet-4-7",
+  model: "claude-opus-4-7",
   port: 8765,
   has_api_key: false,
 };
@@ -139,9 +139,11 @@ function App() {
       }));
     });
     const unlistenUsage = api.onTokenUsage(setUsage);
+    const unlistenStatus = api.onServerStatus(setStatus);
     return () => {
       unlisten.then((dispose) => dispose()).catch(() => undefined);
       unlistenUsage.then((dispose) => dispose()).catch(() => undefined);
+      unlistenStatus.then((dispose) => dispose()).catch(() => undefined);
     };
   }, [handleError, refreshLogs, refreshUsage]);
 
@@ -297,7 +299,7 @@ function App() {
                   icon={<Tag size={15} />}
                   label="模型名称"
                   value={config.model}
-                  placeholder="claude-sonnet-4-7"
+                  placeholder="claude-opus-4-7"
                   onChange={(model) => setConfig((current) => ({ ...current, model }))}
                 />
                 <LabeledInput

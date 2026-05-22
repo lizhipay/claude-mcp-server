@@ -70,7 +70,7 @@ type Unlisten = () => void;
 
 const mockConfig: AppConfig = {
   api_url: "https://api.anthropic.com",
-  model: "claude-sonnet-4-7",
+  model: "claude-opus-4-7",
   port: 8765,
   has_api_key: false,
 };
@@ -132,5 +132,9 @@ export const api = {
   onTokenUsage: (handler: (snapshot: TokenUsageSnapshot) => void) =>
     isTauriRuntime()
       ? tauriListen<TokenUsageSnapshot>("token-usage-updated", (event) => handler(event.payload))
+      : Promise.resolve<Unlisten>(() => undefined),
+  onServerStatus: (handler: (status: ServerStatus) => void) =>
+    isTauriRuntime()
+      ? tauriListen<ServerStatus>("server-status-updated", (event) => handler(event.payload))
       : Promise.resolve<Unlisten>(() => undefined),
 };
