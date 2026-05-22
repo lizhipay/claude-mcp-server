@@ -64,7 +64,7 @@ impl ServerController {
             health_url: None,
             message: "正在唤醒…".to_string(),
         };
-        app_state.logs().clear();
+        app_state.logs().clear_stats();
         app_state.logs().push(
             LogLevel::Info,
             "server",

@@ -3,7 +3,7 @@ use tauri::{AppHandle, State};
 use crate::{
     claude, config,
     config::{AppConfig, SaveConfigPayload},
-    logs::LogSnapshot,
+    logs::{LogEntry, LogLevel, LogPage, LogStats},
     server::ServerStatus,
     state::AppState,
     token_usage::TokenUsageSnapshot,
@@ -78,13 +78,31 @@ pub async fn get_server_status(state: State<'_, AppState>) -> Result<ServerStatu
 }
 
 #[tauri::command]
-pub async fn get_logs(state: State<'_, AppState>) -> Result<LogSnapshot, String> {
-    Ok(state.logs().snapshot())
+pub async fn get_log_stats(state: State<'_, AppState>) -> Result<LogStats, String> {
+    Ok(state.logs().stats())
 }
 
 #[tauri::command]
-pub async fn clear_logs(state: State<'_, AppState>) -> Result<LogSnapshot, String> {
-    Ok(state.logs().clear())
+pub async fn get_log_page(
+    state: State<'_, AppState>,
+    level: Option<LogLevel>,
+    offset: usize,
+    limit: usize,
+) -> Result<LogPage, String> {
+    Ok(state.logs().page(level, offset, limit))
+}
+
+#[tauri::command]
+pub async fn get_log_detail(state: State<'_, AppState>, id: u64) -> Result<LogEntry, String> {
+    state
+        .logs()
+        .detail(id)
+        .ok_or_else(|| "日志详情不存在或已被清理".to_string())
+}
+
+#[tauri::command]
+pub async fn clear_logs(state: State<'_, AppState>) -> Result<LogStats, String> {
+    Ok(state.logs().clear_stats())
 }
 
 #[tauri::command]

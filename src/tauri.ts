@@ -33,12 +33,37 @@ export interface LogEntry {
   request_id?: string | null;
   task_id?: string | null;
   summary: string;
-  detail?: Record<string, unknown> | null;
+  detail?: unknown | null;
 }
 
-export interface LogSnapshot {
-  entries: LogEntry[];
+export interface LogListEntry {
+  id: number;
+  time: string;
+  level: LogLevel;
+  source: string;
+  request_id?: string | null;
+  task_id?: string | null;
+  summary: string;
+  has_detail: boolean;
+}
+
+export interface LogStats {
+  total: number;
   dropped: number;
+  debug: number;
+  info: number;
+  warn: number;
+  error: number;
+  latest_id?: number | null;
+}
+
+export interface LogPage {
+  entries: LogListEntry[];
+  total: number;
+  offset: number;
+  limit: number;
+  dropped: number;
+  latest_id?: number | null;
 }
 
 export interface TokenUsageTotals {
@@ -95,6 +120,25 @@ const emptyTokenUsage: TokenUsageSnapshot = {
   updated_at: null,
 };
 
+const emptyLogStats: LogStats = {
+  total: 0,
+  dropped: 0,
+  debug: 0,
+  info: 0,
+  warn: 0,
+  error: 0,
+  latest_id: null,
+};
+
+const emptyLogPage: LogPage = {
+  entries: [],
+  total: 0,
+  offset: 0,
+  limit: 0,
+  dropped: 0,
+  latest_id: null,
+};
+
 function isTauriRuntime(): boolean {
   return typeof window !== "undefined" && "__TAURI_INTERNALS__" in window;
 }
@@ -119,15 +163,31 @@ export const api = {
   startServer: () => invoke<ServerStatus>("start_mcp_server", undefined, () => mockStatus),
   stopServer: () => invoke<ServerStatus>("stop_mcp_server", undefined, () => mockStatus),
   getStatus: () => invoke<ServerStatus>("get_server_status", undefined, () => mockStatus),
-  getLogs: () => invoke<LogSnapshot>("get_logs", undefined, () => ({ entries: [], dropped: 0 })),
-  clearLogs: () => invoke<LogSnapshot>("clear_logs", undefined, () => ({ entries: [], dropped: 0 })),
+  getLogStats: () => invoke<LogStats>("get_log_stats", undefined, () => emptyLogStats),
+  getLogPage: (level: LogLevel | null, offset: number, limit: number) =>
+    invoke<LogPage>("get_log_page", { level, offset, limit }, () => emptyLogPage),
+  getLogDetail: (id: number) =>
+    invoke<LogEntry>(
+      "get_log_detail",
+      { id },
+      () =>
+        ({
+          id,
+          time: "",
+          level: "info",
+          source: "",
+          summary: "",
+          detail: null,
+        }) satisfies LogEntry,
+    ),
+  clearLogs: () => invoke<LogStats>("clear_logs", undefined, () => emptyLogStats),
   getTokenUsage: () =>
     invoke<TokenUsageSnapshot>("get_token_usage", undefined, () => emptyTokenUsage),
   clearTokenUsage: () =>
     invoke<TokenUsageSnapshot>("clear_token_usage", undefined, () => emptyTokenUsage),
-  onLog: (handler: (entry: LogEntry) => void) =>
+  onLogStatsUpdated: (handler: () => void) =>
     isTauriRuntime()
-      ? tauriListen<LogEntry>("log-entry", (event) => handler(event.payload))
+      ? tauriListen("log-stats-updated", () => handler())
       : Promise.resolve<Unlisten>(() => undefined),
   onTokenUsage: (handler: (snapshot: TokenUsageSnapshot) => void) =>
     isTauriRuntime()

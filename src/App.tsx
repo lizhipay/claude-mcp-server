@@ -30,12 +30,21 @@ import {
 import type {
   AppConfig,
   LogEntry,
+  LogListEntry,
   LogLevel,
-  LogSnapshot,
+  LogPage,
+  LogStats,
   ServerStatus,
   TokenUsageSnapshot,
 } from "./tauri";
 import { api } from "./tauri";
+import {
+  formatLogDetail,
+  getLogCountForLevel,
+  getVirtualLogWindow,
+  LOG_ROW_HEIGHT,
+  type LogLevelFilter,
+} from "./log-utils";
 
 const defaultConfig: AppConfig = {
   api_url: "https://api.anthropic.com",
@@ -64,9 +73,9 @@ const defaultUsage: TokenUsageSnapshot = {
   updated_at: null,
 };
 
-const logLevelOptions: Array<LogLevel | "all"> = ["all", "debug", "info", "warn", "error"];
+const logLevelOptions: LogLevelFilter[] = ["all", "debug", "info", "warn", "error"];
 
-const filterLabel: Record<LogLevel | "all", string> = {
+const filterLabel: Record<LogLevelFilter, string> = {
   all: "全部",
   debug: "Debug",
   info: "Info",
@@ -83,28 +92,55 @@ const statusCopy = {
 
 type ActiveTab = "main" | "usage" | "logs";
 
+const emptyLogStats: LogStats = {
+  total: 0,
+  dropped: 0,
+  debug: 0,
+  info: 0,
+  warn: 0,
+  error: 0,
+  latest_id: null,
+};
+
+const emptyLogPage: LogPage = {
+  entries: [],
+  total: 0,
+  offset: 0,
+  limit: 0,
+  dropped: 0,
+  latest_id: null,
+};
+
 function App() {
   const [config, setConfig] = useState<AppConfig>(defaultConfig);
   const [apiKey, setApiKey] = useState("");
   const [status, setStatus] = useState<ServerStatus>(defaultStatus);
-  const [logs, setLogs] = useState<LogSnapshot>({ entries: [], dropped: 0 });
+  const [logStats, setLogStats] = useState<LogStats>(emptyLogStats);
+  const [logPage, setLogPage] = useState<LogPage>(emptyLogPage);
   const [usage, setUsage] = useState<TokenUsageSnapshot>(defaultUsage);
   const [activeTab, setActiveTab] = useState<ActiveTab>("main");
-  const [level, setLevel] = useState<LogLevel | "all">("all");
+  const [level, setLevel] = useState<LogLevelFilter>("all");
   const [autoScroll, setAutoScroll] = useState(true);
   const [copied, setCopied] = useState(false);
   const [busy, setBusy] = useState(false);
   const [toast, setToast] = useState("");
   const [error, setError] = useState("");
+  const [logScrollTop, setLogScrollTop] = useState(0);
+  const [logViewportHeight, setLogViewportHeight] = useState(0);
+  const [selectedLog, setSelectedLog] = useState<LogListEntry | null>(null);
+  const [selectedLogDetail, setSelectedLogDetail] = useState<LogEntry | null>(null);
+  const [logDetailLoading, setLogDetailLoading] = useState(false);
+  const [logDetailError, setLogDetailError] = useState("");
   const logListRef = useRef<HTMLDivElement | null>(null);
 
-  const visibleLogs = useMemo(() => {
-    if (level === "all") return logs.entries;
-    return logs.entries.filter((entry) => entry.level === level);
-  }, [level, logs.entries]);
+  const activeLogTotal = getLogCountForLevel(logStats, level);
+  const logWindow = useMemo(
+    () => getVirtualLogWindow(logScrollTop, logViewportHeight, activeLogTotal),
+    [activeLogTotal, logScrollTop, logViewportHeight],
+  );
 
-  const refreshLogs = useCallback(async () => {
-    setLogs(await api.getLogs());
+  const refreshLogStats = useCallback(async () => {
+    setLogStats(await api.getLogStats());
   }, []);
 
   const refreshUsage = useCallback(async () => {
@@ -129,29 +165,115 @@ function App() {
       .getStatus()
       .then(setStatus)
       .catch(handleError);
-    refreshLogs().catch(handleError);
+    refreshLogStats().catch(handleError);
     refreshUsage().catch(handleError);
 
-    const unlisten = api.onLog((entry: LogEntry) => {
-      setLogs((current) => ({
-        dropped: current.dropped,
-        entries: [...current.entries.slice(-4998), entry],
-      }));
+    const unlistenLogs = api.onLogStatsUpdated(() => {
+      refreshLogStats().catch(handleError);
     });
     const unlistenUsage = api.onTokenUsage(setUsage);
     const unlistenStatus = api.onServerStatus(setStatus);
     return () => {
-      unlisten.then((dispose) => dispose()).catch(() => undefined);
+      unlistenLogs.then((dispose) => dispose()).catch(() => undefined);
       unlistenUsage.then((dispose) => dispose()).catch(() => undefined);
       unlistenStatus.then((dispose) => dispose()).catch(() => undefined);
     };
-  }, [handleError, refreshLogs, refreshUsage]);
+  }, [handleError, refreshLogStats, refreshUsage]);
 
   useEffect(() => {
-    if (autoScroll && logListRef.current) {
-      logListRef.current.scrollTop = logListRef.current.scrollHeight;
+    if (activeTab !== "logs") return;
+    refreshLogStats().catch(handleError);
+  }, [activeTab, handleError, refreshLogStats]);
+
+  useEffect(() => {
+    if (activeTab !== "logs") return;
+    const element = logListRef.current;
+    if (!element) return;
+
+    const updateSize = () => setLogViewportHeight(element.clientHeight);
+    updateSize();
+    const observer = new ResizeObserver(updateSize);
+    observer.observe(element);
+    return () => observer.disconnect();
+  }, [activeTab]);
+
+  useEffect(() => {
+    if (activeTab !== "logs") return;
+    if (activeLogTotal === 0 || logWindow.limit === 0) {
+      setLogPage(emptyLogPage);
+      return;
     }
-  }, [activeTab, autoScroll, visibleLogs]);
+
+    let cancelled = false;
+    const selectedLevel = level === "all" ? null : level;
+    api
+      .getLogPage(selectedLevel, logWindow.offset, logWindow.limit)
+      .then((page) => {
+        if (!cancelled) setLogPage(page);
+      })
+      .catch((err) => {
+        if (!cancelled) handleError(err);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [
+    activeLogTotal,
+    activeTab,
+    handleError,
+    level,
+    logStats.latest_id,
+    logWindow.limit,
+    logWindow.offset,
+  ]);
+
+  useEffect(() => {
+    if (activeTab !== "logs" || !autoScroll || !logListRef.current) return;
+    const nextScrollTop = Math.max(
+      0,
+      activeLogTotal * LOG_ROW_HEIGHT - logListRef.current.clientHeight,
+    );
+    logListRef.current.scrollTop = nextScrollTop;
+    setLogScrollTop(nextScrollTop);
+  }, [activeLogTotal, activeTab, autoScroll]);
+
+  useEffect(() => {
+    setSelectedLog(null);
+    setSelectedLogDetail(null);
+    setLogDetailError("");
+    if (!autoScroll && logListRef.current) {
+      logListRef.current.scrollTop = 0;
+      setLogScrollTop(0);
+    }
+  }, [level, autoScroll]);
+
+  useEffect(() => {
+    if (!selectedLog) return;
+    setSelectedLogDetail(null);
+    setLogDetailError("");
+    if (!selectedLog.has_detail) {
+      setLogDetailLoading(false);
+      return;
+    }
+
+    let cancelled = false;
+    setLogDetailLoading(true);
+    api
+      .getLogDetail(selectedLog.id)
+      .then((entry) => {
+        if (!cancelled) setSelectedLogDetail(entry);
+      })
+      .catch((err) => {
+        if (!cancelled) setLogDetailError(err instanceof Error ? err.message : String(err));
+      })
+      .finally(() => {
+        if (!cancelled) setLogDetailLoading(false);
+      });
+
+    return () => {
+      cancelled = true;
+    };
+  }, [selectedLog]);
 
   async function saveConfig() {
     setBusy(true);
@@ -195,7 +317,7 @@ function App() {
       const next =
         status.status === "running" ? await api.stopServer() : await api.startServer();
       setStatus(next);
-      await refreshLogs();
+      await refreshLogStats();
     } catch (err) {
       setStatus((current) => ({ ...current, status: "error", message: "启动失败" }));
       handleError(err);
@@ -213,7 +335,16 @@ function App() {
   }
 
   async function clearLogs() {
-    setLogs(await api.clearLogs());
+    const stats = await api.clearLogs();
+    setLogStats(stats);
+    setLogPage(emptyLogPage);
+    setSelectedLog(null);
+    setSelectedLogDetail(null);
+    setLogDetailError("");
+    if (logListRef.current) {
+      logListRef.current.scrollTop = 0;
+    }
+    setLogScrollTop(0);
   }
 
   async function clearTokenUsage() {
@@ -365,7 +496,7 @@ function App() {
                     {status.status === "running" ? <Square size={15} /> : <Play size={15} />}
                     {status.status === "running" ? "停止服务" : "启动服务"}
                   </button>
-                  <button className="soft-button ghost" onClick={refreshLogs}>
+                  <button className="soft-button ghost" onClick={refreshLogStats}>
                     <RefreshCw size={15} />
                     刷新
                   </button>
@@ -395,7 +526,12 @@ function App() {
                 <ScrollText size={18} />
                 <h2>运行日志</h2>
               </div>
-              {logs.dropped > 0 ? <div className="sweep-note">早期日志已清理</div> : null}
+              <div className="log-head-meta">
+                <span>
+                  显示 {activeLogTotal.toLocaleString()} / {logStats.total.toLocaleString()}
+                </span>
+                {logStats.dropped > 0 ? <span className="sweep-note">早期日志已清理</span> : null}
+              </div>
             </div>
 
             <div className="log-toolbar">
@@ -426,16 +562,47 @@ function App() {
               </button>
             </div>
 
-            <div className="log-list" ref={logListRef}>
-              {visibleLogs.length === 0 ? (
+            <div
+              className="log-list"
+              ref={logListRef}
+              onScroll={(event) => setLogScrollTop(event.currentTarget.scrollTop)}
+            >
+              {activeLogTotal === 0 ? (
                 <div className="empty-log">
                   <FileText size={34} />
                   <p>暂无日志</p>
                 </div>
               ) : (
-                visibleLogs.map((entry) => <LogRow key={entry.id} entry={entry} expanded />)
+                <div className="log-spacer" style={{ height: logWindow.totalHeight }}>
+                  <div
+                    className="log-window"
+                    style={{ transform: `translateY(${logWindow.translateY}px)` }}
+                  >
+                    {logPage.entries.map((entry) => (
+                      <LogRow
+                        key={entry.id}
+                        entry={entry}
+                        selected={selectedLog?.id === entry.id}
+                        onSelect={() =>
+                          setSelectedLog((current) =>
+                            current?.id === entry.id ? null : entry,
+                          )
+                        }
+                      />
+                    ))}
+                  </div>
+                </div>
               )}
             </div>
+            {selectedLog ? (
+              <LogDetailPane
+                entry={selectedLog}
+                detail={selectedLogDetail}
+                loading={logDetailLoading}
+                error={logDetailError}
+                onClose={() => setSelectedLog(null)}
+              />
+            ) : null}
           </section>
         )}
       </div>
@@ -630,16 +797,60 @@ function formatUpdatedAt(value: string) {
   })}`;
 }
 
-function LogRow({ entry, expanded = false }: { entry: LogEntry; expanded?: boolean }) {
+function LogRow({
+  entry,
+  selected,
+  onSelect,
+}: {
+  entry: LogListEntry;
+  selected: boolean;
+  onSelect: () => void;
+}) {
   return (
-    <details className={`log-row ${entry.level}`} open={expanded && entry.level === "error"}>
-      <summary>
-        <span className="log-time">{entry.time}</span>
-        <span className="log-source">{entry.source}</span>
-        <span className="log-summary">{entry.summary}</span>
-      </summary>
-      {entry.detail ? <pre>{JSON.stringify(entry.detail, null, 2)}</pre> : null}
-    </details>
+    <button
+      className={`log-row ${entry.level}${selected ? " selected" : ""}`}
+      type="button"
+      onClick={onSelect}
+      title={entry.has_detail ? "查看详情" : "暂无详情"}
+    >
+      <span className="log-time">{entry.time}</span>
+      <span className="log-source">{entry.source}</span>
+      <span className="log-summary">{entry.summary}</span>
+    </button>
+  );
+}
+
+function LogDetailPane({
+  entry,
+  detail,
+  loading,
+  error,
+  onClose,
+}: {
+  entry: LogListEntry;
+  detail: LogEntry | null;
+  loading: boolean;
+  error: string;
+  onClose: () => void;
+}) {
+  const content = useMemo(() => {
+    if (loading) return "加载中...";
+    if (error) return error;
+    if (!entry.has_detail) return "暂无详情";
+    return formatLogDetail(detail?.detail);
+  }, [detail, entry.has_detail, error, loading]);
+
+  return (
+    <aside className="log-detail-pane">
+      <header>
+        <span>{entry.time}</span>
+        <strong>{entry.source}</strong>
+        <button type="button" onClick={onClose}>
+          关闭
+        </button>
+      </header>
+      <pre>{content}</pre>
+    </aside>
   );
 }
 

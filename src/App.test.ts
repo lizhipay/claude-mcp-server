@@ -1,4 +1,5 @@
 import { describe, expect, it } from "vitest";
+import { formatLogDetail, getLogCountForLevel, getVirtualLogWindow } from "./log-utils";
 import { maskSecretForDisplay } from "./ui-utils";
 
 describe("maskSecretForDisplay", () => {
@@ -8,5 +9,34 @@ describe("maskSecretForDisplay", () => {
 
   it("masks long keys", () => {
     expect(maskSecretForDisplay("sk-ant-1234567890abcdef")).toBe("sk-a…cdef");
+  });
+});
+
+describe("log utilities", () => {
+  const stats = {
+    total: 100,
+    dropped: 0,
+    debug: 10,
+    info: 20,
+    warn: 30,
+    error: 40,
+    latest_id: 100,
+  };
+
+  it("counts current log level", () => {
+    expect(getLogCountForLevel(stats, "all")).toBe(100);
+    expect(getLogCountForLevel(stats, "error")).toBe(40);
+  });
+
+  it("calculates a small virtual render window", () => {
+    const window = getVirtualLogWindow(42 * 500, 420, 1_000_000);
+    expect(window.offset).toBeLessThan(500);
+    expect(window.limit).toBeLessThan(80);
+    expect(window.totalHeight).toBe(42_000_000);
+  });
+
+  it("formats detail lazily with truncation", () => {
+    expect(formatLogDetail({ ok: true })).toContain('"ok": true');
+    expect(formatLogDetail("abcdef", 3)).toContain("已截断显示");
   });
 });

@@ -175,6 +175,16 @@ button:disabled {
   align-items: center;
 }
 
+.log-head-meta {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-left: auto;
+  color: #8b7d76;
+  font-size: 11px;
+  white-space: nowrap;
+}
+
 .section-title,
 .service-title {
   gap: 8px;
@@ -612,12 +622,26 @@ button:disabled {
 }
 
 .log-list {
+  position: relative;
   flex: 1;
   min-height: 0;
   overflow: auto;
   padding: 10px;
   border-radius: 12px;
   background: #2d2640;
+}
+
+.log-spacer {
+  position: relative;
+  min-height: 100%;
+}
+
+.log-window {
+  position: absolute;
+  top: 0;
+  right: 0;
+  left: 0;
+  will-change: transform;
 }
 
 .empty-log {
@@ -639,13 +663,26 @@ button:disabled {
 
 .log-row {
   position: relative;
+  display: grid;
+  grid-template-columns: 88px minmax(86px, 110px) minmax(0, 1fr);
+  gap: 10px;
+  align-items: center;
+  width: 100%;
+  height: 36px;
+  padding: 0 12px 0 14px;
   margin-bottom: 6px;
   overflow: hidden;
   color: #e8e1f4;
+  text-align: left;
   border-radius: 10px;
   background: rgba(255, 255, 255, 0.065);
   font-family: "JetBrains Mono", "Fira Code", monospace;
   font-size: 12px;
+}
+
+.log-row.selected {
+  background: rgba(169, 151, 229, 0.24);
+  box-shadow: inset 0 0 0 1px rgba(169, 151, 229, 0.32);
 }
 
 .log-row::before {
@@ -674,28 +711,49 @@ button:disabled {
   background: #ff7f8f;
 }
 
-.log-row summary {
-  display: grid;
-  grid-template-columns: 88px minmax(86px, 110px) minmax(0, 1fr);
-  gap: 10px;
+.log-detail-pane {
+  flex: 0 0 auto;
+  margin-top: 10px;
+  overflow: hidden;
+  color: #e8e1f4;
+  border-radius: 12px;
+  background: #2d2640;
+}
+
+.log-detail-pane header {
+  display: flex;
   align-items: center;
-  min-height: 36px;
-  padding: 0 12px 0 14px;
-  cursor: pointer;
-  list-style: none;
+  gap: 10px;
+  min-height: 34px;
+  padding: 0 12px;
+  color: #c8bfd8;
+  border-bottom: 1px solid rgba(255, 255, 255, 0.08);
+  font-size: 12px;
 }
 
-.log-row summary::-webkit-details-marker {
-  display: none;
+.log-detail-pane header strong {
+  color: #f3eff8;
 }
 
-.log-row pre {
+.log-detail-pane header button {
+  margin-left: auto;
+  color: #ffffff;
+  border-radius: 9px;
+  background: rgba(169, 151, 229, 0.42);
+  font-size: 11px;
+  padding: 5px 9px;
+}
+
+.log-detail-pane pre {
+  max-height: 154px;
   margin: 0;
   padding: 8px 12px 10px 14px;
   overflow: auto;
   color: #f3eff8;
-  border-top: 1px solid rgba(255, 255, 255, 0.08);
   white-space: pre-wrap;
+  word-break: break-word;
+  font-family: "JetBrains Mono", "Fira Code", monospace;
+  font-size: 12px;
 }
 
 .log-source,
