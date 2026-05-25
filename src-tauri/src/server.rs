@@ -253,6 +253,18 @@ mod tests {
             tool_names.contains(&"code_status".to_string()),
             "tools: {tool_names:?}"
         );
+        assert!(
+            tool_names.contains(&"code_wait".to_string()),
+            "tools: {tool_names:?}"
+        );
+        assert!(
+            tool_names.contains(&"code_batch_wait".to_string()),
+            "tools: {tool_names:?}"
+        );
+        assert!(
+            tool_names.contains(&"code_batch_result".to_string()),
+            "tools: {tool_names:?}"
+        );
 
         let call = post_mcp(
             &client,
@@ -270,6 +282,27 @@ mod tests {
         .await;
         assert_eq!(call["id"], 3);
         assert_eq!(call["result"]["isError"], true);
+
+        let batch = post_mcp(
+            &client,
+            &mcp_url,
+            json!({
+                "jsonrpc": "2.0",
+                "id": 4,
+                "method": "tools/call",
+                "params": {
+                    "name": "code_batch_result",
+                    "arguments": {"job_ids": ["missing"]}
+                }
+            }),
+        )
+        .await;
+        assert_eq!(batch["id"], 4);
+        assert_eq!(batch["result"]["structuredContent"]["total"], 1);
+        assert_eq!(
+            batch["result"]["structuredContent"]["not_found"][0]["job_id"],
+            "missing"
+        );
 
         state.server().stop(state.clone()).await.unwrap();
     }

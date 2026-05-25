@@ -1,6 +1,6 @@
 [package]
 name = "cclaude-mcp"
-version = "0.1.4"
+version = "0.1.5"
 description = "Cute desktop Claude Code MCP server without Claude Code CLI"
 authors = ["Zoe"]
 edition = "2021"
@@ -16,6 +16,8 @@ tauri-build = { version = "2.6.2", features = [] }
 anyhow = "1.0.100"
 axum = "0.8.7"
 chrono = { version = "0.4.42", features = ["serde"] }
+crossbeam-queue = "0.3.12"
+dashmap = "6.1.0"
 directories = "6.0.0"
 futures-util = "0.3.31"
 reqwest = { version = "0.12.24", default-features = false, features = ["json", "rustls-tls", "stream"] }

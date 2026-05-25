@@ -7,6 +7,7 @@ import {
   ArrowUp,
   BarChart3,
   Check,
+  CircleAlert,
   Copy,
   Database,
   Eye,
@@ -14,6 +15,7 @@ import {
   FileText,
   Globe,
   Hash,
+  Info,
   KeyRound,
   LayoutDashboard,
   Play,
@@ -22,6 +24,8 @@ import {
   ScrollText,
   Server,
   Settings2,
+  ShieldCheck,
+  Sparkles,
   Square,
   Tag,
   Trash2,
@@ -34,10 +38,15 @@ import type {
   LogLevel,
   LogPage,
   LogStats,
+  RuntimeStatsSnapshot,
   ServerStatus,
   TokenUsageSnapshot,
 } from "./tauri";
 import { api } from "./tauri";
+import mascotAvatar from "./assets/reference/brand-avatar.png";
+import mascotBunny from "./assets/reference/service-bunny.png";
+import mascotPeek from "./assets/reference/main-peek.png";
+import mascotUsage from "./assets/reference/usage-peek.png";
 import {
   formatLogDetail,
   getLogCountForLevel,
@@ -83,13 +92,6 @@ const filterLabel: Record<LogLevelFilter, string> = {
   error: "Error",
 };
 
-const statusCopy = {
-  stopped: { label: "已停止", className: "idle" },
-  starting: { label: "启动中...", className: "starting" },
-  running: { label: "运行中", className: "running" },
-  error: { label: "异常", className: "error" },
-} as const;
-
 type ActiveTab = "main" | "usage" | "logs";
 
 const emptyLogStats: LogStats = {
@@ -111,16 +113,33 @@ const emptyLogPage: LogPage = {
   latest_id: null,
 };
 
+const defaultRuntimeStats: RuntimeStatsSnapshot = {
+  total_jobs: 0,
+  queued_jobs: 0,
+  running_jobs: 0,
+  succeeded_jobs: 0,
+  failed_jobs: 0,
+  cancelled_jobs: 0,
+  active_upstream_requests: 0,
+  logs_retained: 0,
+  logs_dropped: 0,
+  logs_pending: 0,
+  token_pending: 0,
+  token_updated_at: null,
+};
+
 function App() {
   const [config, setConfig] = useState<AppConfig>(defaultConfig);
   const [apiKey, setApiKey] = useState("");
+  const [lastSavedAt, setLastSavedAt] = useState("");
   const [status, setStatus] = useState<ServerStatus>(defaultStatus);
   const [logStats, setLogStats] = useState<LogStats>(emptyLogStats);
   const [logPage, setLogPage] = useState<LogPage>(emptyLogPage);
   const [usage, setUsage] = useState<TokenUsageSnapshot>(defaultUsage);
+  const [runtimeStats, setRuntimeStats] = useState<RuntimeStatsSnapshot>(defaultRuntimeStats);
   const [activeTab, setActiveTab] = useState<ActiveTab>("main");
   const [level, setLevel] = useState<LogLevelFilter>("all");
-  const [autoScroll, setAutoScroll] = useState(true);
+  const [isLogHovered, setIsLogHovered] = useState(false);
   const [copied, setCopied] = useState(false);
   const [busy, setBusy] = useState(false);
   const [toast, setToast] = useState("");
@@ -147,6 +166,14 @@ function App() {
     setUsage(await api.getTokenUsage());
   }, []);
 
+  const refreshStatus = useCallback(async () => {
+    setStatus(await api.getStatus());
+  }, []);
+
+  const refreshRuntimeStats = useCallback(async () => {
+    setRuntimeStats(await api.getRuntimeStats());
+  }, []);
+
   const showToast = useCallback((message: string) => {
     setToast(message);
     window.setTimeout(() => setToast(""), 1600);
@@ -167,23 +194,37 @@ function App() {
       .catch(handleError);
     refreshLogStats().catch(handleError);
     refreshUsage().catch(handleError);
+    refreshRuntimeStats().catch(handleError);
 
     const unlistenLogs = api.onLogStatsUpdated(() => {
       refreshLogStats().catch(handleError);
+      refreshRuntimeStats().catch(handleError);
     });
-    const unlistenUsage = api.onTokenUsage(setUsage);
+    const unlistenUsage = api.onTokenUsage((snapshot) => {
+      setUsage(snapshot);
+      refreshRuntimeStats().catch(handleError);
+    });
     const unlistenStatus = api.onServerStatus(setStatus);
+    const unlistenRuntime = api.onRuntimeStats(() => {
+      refreshRuntimeStats().catch(handleError);
+    });
     return () => {
       unlistenLogs.then((dispose) => dispose()).catch(() => undefined);
       unlistenUsage.then((dispose) => dispose()).catch(() => undefined);
       unlistenStatus.then((dispose) => dispose()).catch(() => undefined);
+      unlistenRuntime.then((dispose) => dispose()).catch(() => undefined);
     };
-  }, [handleError, refreshLogStats, refreshUsage]);
+  }, [handleError, refreshLogStats, refreshRuntimeStats, refreshUsage]);
 
   useEffect(() => {
     if (activeTab !== "logs") return;
     refreshLogStats().catch(handleError);
   }, [activeTab, handleError, refreshLogStats]);
+
+  useEffect(() => {
+    if (activeTab !== "usage") return;
+    refreshUsage().catch(handleError);
+  }, [activeTab, handleError, refreshUsage]);
 
   useEffect(() => {
     if (activeTab !== "logs") return;
@@ -228,24 +269,20 @@ function App() {
   ]);
 
   useEffect(() => {
-    if (activeTab !== "logs" || !autoScroll || !logListRef.current) return;
+    if (activeTab !== "logs" || isLogHovered || !logListRef.current) return;
     const nextScrollTop = Math.max(
       0,
       activeLogTotal * LOG_ROW_HEIGHT - logListRef.current.clientHeight,
     );
     logListRef.current.scrollTop = nextScrollTop;
     setLogScrollTop(nextScrollTop);
-  }, [activeLogTotal, activeTab, autoScroll]);
+  }, [activeLogTotal, activeTab, isLogHovered]);
 
   useEffect(() => {
     setSelectedLog(null);
     setSelectedLogDetail(null);
     setLogDetailError("");
-    if (!autoScroll && logListRef.current) {
-      logListRef.current.scrollTop = 0;
-      setLogScrollTop(0);
-    }
-  }, [level, autoScroll]);
+  }, [level]);
 
   useEffect(() => {
     if (!selectedLog) return;
@@ -287,6 +324,14 @@ function App() {
       });
       setConfig(saved);
       setApiKey("");
+      setLastSavedAt(
+        new Date().toLocaleTimeString("zh-CN", {
+          hour: "2-digit",
+          minute: "2-digit",
+          second: "2-digit",
+          hour12: false,
+        }),
+      );
       showToast("已保存");
     } catch (err) {
       handleError(err);
@@ -360,17 +405,23 @@ function App() {
     }
   }
 
-  const statusMeta = statusCopy[status.status];
   const canCopy = Boolean(status.mcp_url);
 
   return (
     <main className="app-shell">
-      <header className="titlebar">
-        <div className="brand">
-          <BrandMark />
-          <h1>Claude MCP</h1>
+      <header className="hero-header">
+        <div className="brand-lockup">
+          <img className="brand-avatar" src={mascotAvatar} alt="" />
+          <div className="brand-copy">
+            <h1>
+              Claude
+              <br />
+              MCP
+            </h1>
+            <span className="star star-a" />
+          </div>
         </div>
-        <nav className="tab-switch segmented" aria-label="页面切换" role="tablist">
+        <nav className="tab-switch" aria-label="页面切换" role="tablist">
           <button
             className={activeTab === "main" ? "active" : ""}
             role="tab"
@@ -404,13 +455,17 @@ function App() {
       <div className="tab-panels">
         {activeTab === "main" ? (
           <div className="tab-panel main-panel" role="tabpanel" aria-label="主控台">
-            <section className="card workspace-card" aria-label="配置与服务">
-              <div className="section-title">
-                <Settings2 size={18} />
-                <h2>连接配置</h2>
+            <section className="glass-card config-card" aria-label="连接配置">
+              <img className="peek-mascot" src={mascotPeek} alt="" />
+              <div className="section-heading">
+                <Settings2 size={20} />
+                <div>
+                  <h2>连接配置</h2>
+                  <p>配置 MCP 服务连接信息，确保服务正常运行</p>
+                </div>
               </div>
 
-              <div className="field-grid">
+              <div className="form-card">
                 <LabeledInput
                   icon={<Globe size={15} />}
                   label="API 地址"
@@ -423,7 +478,7 @@ function App() {
                   label="API 密钥"
                   value={apiKey}
                   type="password"
-                  placeholder={config.has_api_key ? "已保存于本地配置" : "sk-ant-..."}
+                  placeholder={config.has_api_key ? "••••••••••••••••••••••••" : "sk-ant-..."}
                   onChange={setApiKey}
                 />
                 <LabeledInput
@@ -439,6 +494,7 @@ function App() {
                   value={String(config.port)}
                   inputMode="numeric"
                   placeholder="8765"
+                  trailing={<Hash size={15} />}
                   onChange={(port) =>
                     setConfig((current) => ({
                       ...current,
@@ -446,61 +502,75 @@ function App() {
                     }))
                   }
                 />
-              </div>
-
-              <div className="button-row">
-                <button className="soft-button" disabled={busy} onClick={saveConfig}>
-                  <Save size={15} />
-                  保存
-                </button>
-                <button className="soft-button ghost" disabled={busy} onClick={testConnection}>
-                  <Zap size={15} />
-                  测试连接
-                </button>
-              </div>
-
-              <div className="section-divider" />
-
-              <div className="service-panel">
-                <div className="service-head">
-                  <div className="service-title">
-                    <Server size={18} />
-                    <h2>MCP 服务</h2>
+                <div className="config-actions">
+                  <button className="primary-button violet" disabled={busy} onClick={saveConfig}>
+                    <Save size={17} />
+                    保存配置
+                  </button>
+                  <button className="soft-button outline" disabled={busy} onClick={testConnection}>
+                    <Zap size={17} />
+                    测试连接
+                  </button>
+                  <div className="save-state">
+                    <span className="state-dot" />
+                    <strong>配置已保存</strong>
+                    <small>{lastSavedAt ? `上次保存于 ${lastSavedAt}` : "本地配置已同步"}</small>
                   </div>
-                  <span className={`status-pill ${statusMeta.className}`}>
-                    <span className="pulse" />
-                    {statusMeta.label}
-                  </span>
                 </div>
+              </div>
+            </section>
 
-                <div className="mcp-address">
-                  <span className="address-label">MCP 地址</span>
+            <section className="glass-card service-card" aria-label="MCP 服务">
+              <img className="bunny-mascot" src={mascotBunny} alt="" />
+              <div className="service-card-head">
+                <div className="section-heading tight">
+                  <Server size={21} />
+                  <div>
+                    <h2>MCP 服务</h2>
+                    <p>管理 MCP 服务的运行状态</p>
+                  </div>
+                </div>
+              </div>
+
+              <div className="address-card">
+                <div className="address-title">
+                  <Globe size={14} />
+                  <strong>MCP 地址</strong>
+                  <span>本地 MCP 服务访问地址</span>
+                </div>
+                <div className="address-line">
                   <code>{status.mcp_url ?? "--"}</code>
                   <button
-                    className="icon-button"
+                    className="copy-button"
                     type="button"
                     title="复制 MCP 地址"
                     disabled={!canCopy}
                     onClick={copyMcpUrl}
                   >
                     {copied ? <Check size={16} /> : <Copy size={16} />}
+                    复制
                   </button>
                 </div>
+                <div className="health-line">
+                  <ShieldCheck size={15} />
+                  {status.status === "running" ? "服务健康运行中，所有系统正常" : status.message}
+                </div>
+                <RuntimeStatsStrip stats={runtimeStats} />
+              </div>
 
-                <div className="button-row service-actions">
-                  <button
-                    className={`primary-button ${status.status === "running" ? "danger" : ""}`}
-                    disabled={busy || status.status === "starting"}
-                    onClick={toggleServer}
-                  >
-                    {status.status === "running" ? <Square size={15} /> : <Play size={15} />}
-                    {status.status === "running" ? "停止服务" : "启动服务"}
-                  </button>
-                  <button className="soft-button ghost" onClick={refreshLogStats}>
-                    <RefreshCw size={15} />
-                    刷新
-                  </button>
-                </div>
+              <div className="service-actions">
+                <button
+                  className={`primary-button wide ${status.status === "running" ? "danger" : "violet"}`}
+                  disabled={busy || status.status === "starting"}
+                  onClick={toggleServer}
+                >
+                  {status.status === "running" ? <Square size={16} /> : <Play size={16} />}
+                  {status.status === "running" ? "停止服务" : "启动服务"}
+                </button>
+                <button className="soft-button wide outline" onClick={refreshStatus}>
+                  <RefreshCw size={17} />
+                  刷新状态
+                </button>
               </div>
             </section>
 
@@ -513,29 +583,28 @@ function App() {
             ) : null}
           </div>
         ) : activeTab === "usage" ? (
-          <UsagePanel
-            usage={usage}
-            busy={busy}
-            onRefresh={refreshUsage}
-            onClear={clearTokenUsage}
-          />
+          <UsagePanel usage={usage} busy={busy} onClear={clearTokenUsage} />
         ) : (
-          <section className="card log-panel" role="tabpanel" aria-label="运行日志">
+          <section className="glass-card log-panel" role="tabpanel" aria-label="运行日志">
             <div className="log-panel-head">
-              <div className="section-title compact">
-                <ScrollText size={18} />
-                <h2>运行日志</h2>
+              <div className="section-heading tight">
+                <ScrollText size={21} />
+                <div>
+                  <h2>运行日志</h2>
+                  <p>查看 MCP 服务的运行日志和事件记录</p>
+                </div>
               </div>
-              <div className="log-head-meta">
-                <span>
-                  显示 {activeLogTotal.toLocaleString()} / {logStats.total.toLocaleString()}
-                </span>
+              <div className="log-head-actions">
                 {logStats.dropped > 0 ? <span className="sweep-note">早期日志已清理</span> : null}
+                <button className="soft-button tiny outline" onClick={clearLogs}>
+                  <Trash2 size={14} />
+                  清空
+                </button>
               </div>
             </div>
 
             <div className="log-toolbar">
-              <div className="segmented level-tabs" role="tablist" aria-label="日志级别">
+              <div className="level-tabs" role="tablist" aria-label="日志级别">
                 {logLevelOptions.map((option) => (
                   <button
                     key={option}
@@ -544,28 +613,23 @@ function App() {
                     aria-selected={level === option}
                     onClick={() => setLevel(option)}
                   >
-                    {filterLabel[option]}
+                    {option === "all" ? <LayoutDashboard size={14} /> : null}
+                    {option === "debug" ? <Sparkles size={14} /> : null}
+                    {option === "info" ? <Info size={14} /> : null}
+                    {option === "warn" ? <AlertTriangle size={14} /> : null}
+                    {option === "error" ? <CircleAlert size={14} /> : null}
+                    {filterLabel[option]}({getLogCountForLevel(logStats, option).toLocaleString()})
                   </button>
                 ))}
               </div>
-              <label className="toggle">
-                <input
-                  type="checkbox"
-                  checked={autoScroll}
-                  onChange={(event) => setAutoScroll(event.currentTarget.checked)}
-                />
-                自动滚动
-              </label>
-              <button className="soft-button tiny" onClick={clearLogs}>
-                <Trash2 size={14} />
-                清空
-              </button>
             </div>
 
             <div
               className="log-list"
               ref={logListRef}
               onScroll={(event) => setLogScrollTop(event.currentTarget.scrollTop)}
+              onMouseEnter={() => setIsLogHovered(true)}
+              onMouseLeave={() => setIsLogHovered(false)}
             >
               {activeLogTotal === 0 ? (
                 <div className="empty-log">
@@ -584,9 +648,7 @@ function App() {
                         entry={entry}
                         selected={selectedLog?.id === entry.id}
                         onSelect={() =>
-                          setSelectedLog((current) =>
-                            current?.id === entry.id ? null : entry,
-                          )
+                          setSelectedLog((current) => (current?.id === entry.id ? null : entry))
                         }
                       />
                     ))}
@@ -612,143 +674,200 @@ function App() {
   );
 }
 
+function RuntimeStatsStrip({ stats }: { stats: RuntimeStatsSnapshot }) {
+  const done = stats.succeeded_jobs + stats.failed_jobs + stats.cancelled_jobs;
+  const items = [
+    ["运行任务", stats.running_jobs],
+    ["上游请求", stats.active_upstream_requests],
+    ["已完成", done],
+    ["日志待写", stats.logs_pending],
+    ["Token 待写", stats.token_pending],
+  ];
+  return (
+    <div className="runtime-strip" aria-label="运行态统计">
+      {items.map(([label, value]) => (
+        <span key={label}>
+          <small>{label}</small>
+          <strong>{formatNumber(Number(value))}</strong>
+        </span>
+      ))}
+    </div>
+  );
+}
+
 function UsagePanel({
   usage,
   busy,
-  onRefresh,
   onClear,
 }: {
   usage: TokenUsageSnapshot;
   busy: boolean;
-  onRefresh: () => Promise<void>;
   onClear: () => Promise<void>;
 }) {
   const cacheTokens = usage.totals.cache_read_tokens + usage.totals.cache_write_tokens;
+  const today = getUsageDay(usage, 0);
+  const yesterday = getUsageDay(usage, 1);
   const cards = [
     {
+      tone: "total",
       label: "全部用量",
       value: usage.totals.total_tokens,
-      meta: `${formatNumber(usage.totals.requests)} 次请求`,
+      detail: `${formatNumber(usage.totals.requests)} 次请求`,
+      trend: formatTrend(today?.total_tokens, yesterday?.total_tokens),
       icon: <Hash size={17} />,
+      wave: true,
     },
     {
+      tone: "input",
       label: "输入",
       value: usage.totals.input_tokens,
-      meta: "Input",
+      detail: "Input",
+      trend: formatTrend(today?.input_tokens, yesterday?.input_tokens),
       icon: <ArrowDown size={17} />,
     },
     {
+      tone: "output",
       label: "输出",
       value: usage.totals.output_tokens,
-      meta: "Output",
+      detail: "Output",
+      trend: formatTrend(today?.output_tokens, yesterday?.output_tokens),
       icon: <ArrowUp size={17} />,
     },
     {
+      tone: "cache",
       label: "缓存",
       value: cacheTokens,
-      meta: `读 ${formatNumber(usage.totals.cache_read_tokens)} / 写 ${formatNumber(
-        usage.totals.cache_write_tokens,
-      )}`,
+      detail: "",
+      trend: formatTrend(
+        today ? today.cache_read_tokens + today.cache_write_tokens : 0,
+        yesterday ? yesterday.cache_read_tokens + yesterday.cache_write_tokens : 0,
+      ),
       icon: <Database size={17} />,
     },
   ];
 
   return (
-    <section className="card usage-panel" role="tabpanel" aria-label="用量统计">
+    <section className="glass-card usage-panel" role="tabpanel" aria-label="用量统计">
       <div className="usage-head">
-        <div className="section-title compact">
-          <BarChart3 size={18} />
-          <h2>用量统计</h2>
+        <div className="section-heading tight">
+          <BarChart3 size={21} />
+          <div>
+            <h2>用量统计</h2>
+            <p>查看 Token 使用情况和每日汇总</p>
+          </div>
         </div>
-        {usage.updated_at ? <span className="usage-updated">{formatUpdatedAt(usage.updated_at)}</span> : null}
+        <button
+          className="soft-button tiny outline"
+          disabled={busy || usage.totals.requests === 0}
+          onClick={onClear}
+        >
+          <Trash2 size={14} />
+          清空统计
+        </button>
       </div>
 
-      <div className="usage-summary">
+      <div className="usage-summary" aria-label="Token 汇总">
         {cards.map((card) => (
-          <article className="usage-summary-card" key={card.label}>
+          <article className={`usage-summary-card ${card.tone}`} key={card.label}>
             <div className="usage-summary-icon">{card.icon}</div>
-            <div>
+            <div className="usage-card-body">
               <p>{card.label}</p>
               <strong>{formatNumber(card.value)}</strong>
-              <span>{card.meta}</span>
+              {card.detail ? <small>{card.detail}</small> : null}
+              {card.wave ? <UsageWave /> : null}
+              <TrendPill value={card.trend} />
             </div>
           </article>
         ))}
       </div>
 
-      <div className="usage-table-wrap">
-        <table className="usage-table">
-          <thead>
-            <tr>
-              <th>日期</th>
-              <th>请求</th>
-              <th>输入</th>
-              <th>输出</th>
-              <th>缓存读</th>
-              <th>缓存写</th>
-              <th>合计</th>
-            </tr>
-          </thead>
-          <tbody>
-            {usage.days.length === 0 ? (
-              <tr className="usage-empty-row">
-                <td colSpan={7}>
-                  <div className="empty-log usage-empty">
-                    <FileText size={34} />
-                    <p>暂无用量数据</p>
-                  </div>
-                </td>
+      <div className="usage-table-stage">
+        <img className="usage-table-mascot" src={mascotUsage} alt="" />
+        <div className="usage-table-wrap">
+          <table className="usage-table">
+            <thead>
+              <tr>
+                <th>日期</th>
+                <th>请求</th>
+                <th>输入</th>
+                <th>输出</th>
+                <th>总量</th>
               </tr>
-            ) : (
-              usage.days.map((day) => (
-                <tr key={day.date}>
-                  <td>{day.date}</td>
-                  <td>{formatNumber(day.requests)}</td>
-                  <td>{formatNumber(day.input_tokens)}</td>
-                  <td>{formatNumber(day.output_tokens)}</td>
-                  <td>{formatNumber(day.cache_read_tokens)}</td>
-                  <td>{formatNumber(day.cache_write_tokens)}</td>
-                  <td>{formatNumber(day.total_tokens)}</td>
+            </thead>
+            <tbody>
+              {usage.days.length === 0 ? (
+                <tr className="usage-empty-row">
+                  <td colSpan={5}>
+                    <div className="usage-empty">
+                      <img src={mascotUsage} alt="" />
+                      <p>暂无用量数据</p>
+                    </div>
+                  </td>
                 </tr>
-              ))
-            )}
-          </tbody>
-        </table>
-      </div>
-
-      <div className="button-row usage-actions">
-        <button className="soft-button ghost" disabled={busy} onClick={onRefresh}>
-          <RefreshCw size={15} />
-          刷新
-        </button>
-        <button
-          className="soft-button ghost"
-          disabled={busy || usage.totals.requests === 0}
-          onClick={onClear}
-        >
-          <Trash2 size={15} />
-          清空统计
-        </button>
+              ) : (
+                usage.days.map((day) => (
+                  <tr key={day.date}>
+                    <td>{day.date}</td>
+                    <td>{formatNumber(day.requests)}</td>
+                    <td>
+                      <strong>{formatNumber(day.input_tokens)}</strong>
+                      <small>
+                        <span>缓存读 {formatNumber(day.cache_read_tokens)}</span>
+                        <span>缓存写 {formatNumber(day.cache_write_tokens)}</span>
+                      </small>
+                    </td>
+                    <td>{formatNumber(day.output_tokens)}</td>
+                    <td>{formatNumber(day.total_tokens)}</td>
+                  </tr>
+                ))
+              )}
+            </tbody>
+          </table>
+        </div>
       </div>
     </section>
+  );
+}
+
+function UsageWave() {
+  return (
+    <svg className="usage-wave" viewBox="0 0 150 42" aria-hidden="true">
+      <path d="M2 30 C14 16, 23 36, 35 24 S55 20, 66 30 S83 38, 96 18 S118 22, 128 11 S140 7, 148 2" />
+    </svg>
+  );
+}
+
+function TrendPill({ value }: { value: string }) {
+  const direction = value.startsWith("+") ? "up" : value.startsWith("-") ? "down" : "flat";
+  const display = value.replace(/^[+-]/, "");
+  return (
+    <span className={`usage-trend ${direction}`}>
+      <span>较昨日</span>
+      {direction !== "flat" ? <b>{direction === "up" ? "↑" : "↓"}</b> : null}
+      <strong>{display}</strong>
+    </span>
   );
 }
 
 function LabeledInput({
   icon,
   label,
+  hint,
   value,
   placeholder,
   type = "text",
   inputMode,
+  trailing,
   onChange,
 }: {
   icon: ReactNode;
   label: string;
+  hint?: string;
   value: string;
   placeholder: string;
   type?: string;
   inputMode?: InputHTMLAttributes<HTMLInputElement>["inputMode"];
+  trailing?: ReactNode;
   onChange: (value: string) => void;
 }) {
   const [visible, setVisible] = useState(false);
@@ -756,8 +875,11 @@ function LabeledInput({
   return (
     <label className="field">
       <span className="field-label">
-        {icon}
-        {label}
+        <span>
+          {icon}
+          {label}
+        </span>
+        {hint ? <small>{hint}</small> : null}
       </span>
       <span className="input-shell">
         <input
@@ -776,6 +898,8 @@ function LabeledInput({
           >
             {visible ? <EyeOff size={16} /> : <Eye size={16} />}
           </button>
+        ) : trailing ? (
+          <span className="input-trailing">{trailing}</span>
         ) : null}
       </span>
     </label>
@@ -784,6 +908,25 @@ function LabeledInput({
 
 function formatNumber(value: number) {
   return new Intl.NumberFormat("zh-CN").format(value || 0);
+}
+
+function getUsageDay(snapshot: TokenUsageSnapshot, daysAgo: number) {
+  const date = new Date();
+  date.setDate(date.getDate() - daysAgo);
+  const key = [
+    date.getFullYear(),
+    String(date.getMonth() + 1).padStart(2, "0"),
+    String(date.getDate()).padStart(2, "0"),
+  ].join("-");
+  return snapshot.days.find((day) => day.date === key);
+}
+
+export function formatTrend(today = 0, yesterday = 0) {
+  if (!yesterday) return "0%";
+  const percent = ((today - yesterday) / yesterday) * 100;
+  if (!Number.isFinite(percent)) return "0%";
+  const rounded = Math.round(percent * 10) / 10;
+  return `${rounded > 0 ? "+" : ""}${rounded.toFixed(1)}%`;
 }
 
 function formatUpdatedAt(value: string) {
@@ -851,39 +994,6 @@ function LogDetailPane({
       </header>
       <pre>{content}</pre>
     </aside>
-  );
-}
-
-function BrandMark() {
-  return (
-    <svg className="brand-mark" viewBox="0 0 96 96" aria-hidden="true">
-      <defs>
-        <linearGradient id="brand-mark-bg" x1="14" y1="12" x2="82" y2="86">
-          <stop offset="0" stopColor="#c9b9ff" />
-          <stop offset="1" stopColor="#8f7ad6" />
-        </linearGradient>
-        <linearGradient id="brand-mark-line" x1="22" y1="20" x2="74" y2="76">
-          <stop offset="0" stopColor="#3f3559" />
-          <stop offset="1" stopColor="#2b2440" />
-        </linearGradient>
-      </defs>
-      <rect x="8" y="8" width="80" height="80" rx="24" fill="url(#brand-mark-bg)" />
-      <path
-        className="brand-mark-face"
-        d="M28 39 32 24l13 11h6l13-11 4 15c6 5 9 12 8 21-2 13-13 21-28 21s-26-8-28-21c-1-9 2-16 8-21Z"
-      />
-      <path
-        className="brand-mark-line"
-        d="M29 41 32 25l13 11h6l13-11 3 16"
-      />
-      <path
-        className="brand-mark-line"
-        d="M22 53c0-17 11-29 26-29s26 12 26 29"
-      />
-      <rect className="brand-mark-accent" x="18" y="51" width="7" height="16" rx="3" />
-      <rect className="brand-mark-accent" x="71" y="51" width="7" height="16" rx="3" />
-      <path className="brand-mark-line thin" d="M38 55h20M41 64h14" />
-    </svg>
   );
 }
 

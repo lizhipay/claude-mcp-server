@@ -14,6 +14,8 @@ const MAX_FILE_CHARS: usize = 220_000;
 const MAX_COMMAND_CHARS: usize = 120_000;
 const CACHE_CONTROL_TTL: &str = "ephemeral";
 const CACHE_PRIMER_WORDS: usize = 5_200;
+const API_FIRST_BYTE_TIMEOUT_SECONDS: u64 = 45;
+const API_STREAM_IDLE_TIMEOUT_SECONDS: u64 = 90;
 
 #[derive(Debug, Clone)]
 pub struct RuntimeConfig {
@@ -47,6 +49,14 @@ struct ContentBlockBuilder {
     input_json: String,
 }
 
+#[derive(Debug, Default)]
+struct StreamEventStats {
+    events: u64,
+    text_chars: usize,
+    tool_uses: u64,
+    usage_events: u64,
+}
+
 pub fn load_runtime_config() -> anyhow::Result<RuntimeConfig> {
     let cfg = config::load_config();
     Ok(RuntimeConfig {
@@ -68,6 +78,7 @@ pub async fn test_connection(state: &AppState) -> anyhow::Result<String> {
         Some(json!({"url": runtime.messages_url, "model": runtime.model, "api_key": runtime.api_key})),
     );
 
+    let _upstream_guard = state.begin_upstream_request();
     let response = state
         .http()
         .post(&runtime.messages_url)
@@ -203,6 +214,7 @@ async fn stream_turn(
         })),
     );
 
+    let _upstream_guard = state.begin_upstream_request();
     let response = state
         .http()
         .post(&runtime.messages_url)
@@ -234,11 +246,31 @@ async fn stream_turn(
     let mut blocks: Vec<ContentBlockBuilder> = Vec::new();
     let mut buffer = String::new();
     let mut stream = response.bytes_stream();
+    let mut stream_stats = StreamEventStats::default();
+    let mut waiting_for_first_chunk = true;
 
-    while let Some(chunk) = stream.next().await {
+    loop {
         if cancel.is_cancelled() {
             anyhow::bail!("任务已取消");
         }
+        let timeout_seconds = if waiting_for_first_chunk {
+            API_FIRST_BYTE_TIMEOUT_SECONDS
+        } else {
+            API_STREAM_IDLE_TIMEOUT_SECONDS
+        };
+        let next_chunk = tokio::select! {
+            _ = cancel.cancelled() => anyhow::bail!("任务已取消"),
+            result = tokio::time::timeout(Duration::from_secs(timeout_seconds), stream.next()) => {
+                match result {
+                    Ok(chunk) => chunk,
+                    Err(_) => anyhow::bail!("Claude Messages 流式响应超过 {} 秒没有数据", timeout_seconds),
+                }
+            }
+        };
+        let Some(chunk) = next_chunk else {
+            break;
+        };
+        waiting_for_first_chunk = false;
         let chunk = chunk?;
         buffer.push_str(&String::from_utf8_lossy(&chunk));
         while let Some(newline) = buffer.find('\n') {
@@ -249,7 +281,7 @@ async fn stream_turn(
                 if data.is_empty() || data == "[DONE]" {
                     continue;
                 }
-                handle_stream_event(state, &request_id, task_id, data, &mut blocks, &mut turn)?;
+                handle_stream_event(data, &mut blocks, &mut turn, &mut stream_stats)?;
             }
         }
     }
@@ -311,7 +343,10 @@ async fn stream_turn(
             "elapsed_ms": started.elapsed().as_millis(),
             "tool_uses": turn.tool_uses.len(),
             "stop_reason": turn.stop_reason,
-            "usage": turn.usage
+            "usage": turn.usage,
+            "stream_events": stream_stats.events,
+            "stream_text_chars": stream_stats.text_chars,
+            "stream_usage_events": stream_stats.usage_events
         })),
     );
 
@@ -324,15 +359,19 @@ fn record_token_usage(
     request_id: Option<String>,
     task_id: Option<String>,
 ) {
-    if let Err(error) = state.token_usage().record_usage(usage) {
-        state.logs().push(
-            LogLevel::Warn,
-            "usage",
-            request_id,
-            task_id,
-            "Token 统计写入失败",
-            Some(json!({"error": error.to_string()})),
-        );
+    match state.token_usage().record_usage(usage) {
+        Ok(_) => state.notify_runtime_stats_changed(),
+        Err(error) => {
+            state.logs().push(
+                LogLevel::Warn,
+                "usage",
+                request_id,
+                task_id,
+                "Token 统计写入失败",
+                Some(json!({"error": error.to_string()})),
+            );
+            state.notify_runtime_stats_changed();
+        }
     }
 }
 
@@ -447,12 +486,10 @@ fn mark_content_for_cache(content: &mut Value) -> bool {
 }
 
 fn handle_stream_event(
-    state: &AppState,
-    request_id: &str,
-    task_id: &str,
     data: &str,
     blocks: &mut Vec<ContentBlockBuilder>,
     turn: &mut ClaudeTurn,
+    stats: &mut StreamEventStats,
 ) -> anyhow::Result<()> {
     let value: Value = serde_json::from_str(data)?;
     let event_type = value
@@ -460,14 +497,7 @@ fn handle_stream_event(
         .and_then(Value::as_str)
         .unwrap_or("unknown")
         .to_string();
-    state.logs().push(
-        LogLevel::Debug,
-        "stream",
-        Some(request_id.to_string()),
-        Some(task_id.to_string()),
-        format!("收到流式事件 {event_type}"),
-        Some(json!({"event": event_type})),
-    );
+    stats.events += 1;
 
     match event_type.as_str() {
         "message_start" => {
@@ -476,6 +506,7 @@ fn handle_stream_event(
                 .and_then(|message| message.get("usage"))
             {
                 merge_usage(&mut turn.usage, usage);
+                stats.usage_events += 1;
             }
         }
         "content_block_start" => {
@@ -489,6 +520,7 @@ fn handle_stream_event(
                     .unwrap_or("")
                     .to_string();
                 if builder.kind == "tool_use" {
+                    stats.tool_uses += 1;
                     builder.id = block
                         .get("id")
                         .and_then(Value::as_str)
@@ -509,6 +541,7 @@ fn handle_stream_event(
                     if let Some(text) = block.get("text").and_then(Value::as_str) {
                         builder.text.push_str(text);
                         turn.text.push_str(text);
+                        stats.text_chars += text.chars().count();
                     }
                 }
             }
@@ -522,6 +555,7 @@ fn handle_stream_event(
                         if let Some(text) = delta.get("text").and_then(Value::as_str) {
                             blocks[index].text.push_str(text);
                             turn.text.push_str(text);
+                            stats.text_chars += text.chars().count();
                         }
                     }
                     "input_json_delta" => {
@@ -543,6 +577,7 @@ fn handle_stream_event(
             }
             if let Some(usage) = value.get("usage") {
                 merge_usage(&mut turn.usage, usage);
+                stats.usage_events += 1;
             }
         }
         _ => {}
@@ -877,11 +912,21 @@ fn minimum_cacheable_tokens(model: &str) -> u64 {
 
 fn cache_read_tokens(usage: &Value) -> u64 {
     number_field(usage, "cache_read_input_tokens")
+        + number_field(usage, "cache_read_tokens")
+        + number_field(usage, "cache_read")
+        + number_field(usage, "cached_tokens")
+        + nested_number_field(usage, &["input_token_details", "cache_read"])
+        + nested_number_field(usage, &["prompt_tokens_details", "cached_tokens"])
 }
 
 fn cache_write_tokens(usage: &Value) -> u64 {
     number_field(usage, "cache_creation_input_tokens")
+        + number_field(usage, "cache_write_tokens")
+        + number_field(usage, "cache_creation_tokens")
+        + number_field(usage, "cache_write")
         + usage.get("cache_creation").map(sum_numbers).unwrap_or(0)
+        + nested_number_field(usage, &["input_token_details", "cache_creation"])
+        + nested_number_field(usage, &["prompt_tokens_details", "cache_creation_tokens"])
 }
 
 fn number_field(value: &Value, key: &str) -> u64 {
@@ -892,6 +937,13 @@ fn number_field(value: &Value, key: &str) -> u64 {
                 .as_u64()
                 .or_else(|| value.as_str().and_then(|raw| raw.parse::<u64>().ok()))
         })
+        .unwrap_or_default()
+}
+
+fn nested_number_field(value: &Value, path: &[&str]) -> u64 {
+    path.iter()
+        .try_fold(value, |current, key| current.get(key))
+        .map(number_value)
         .unwrap_or_default()
 }
 
@@ -924,56 +976,51 @@ mod tests {
 
     #[test]
     fn parses_text_stream_event() {
-        let state = AppState::new();
         let mut blocks = Vec::new();
         let mut turn = ClaudeTurn::default();
+        let mut stats = StreamEventStats::default();
         handle_stream_event(
-            &state,
-            "req",
-            "task",
             r#"{"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}"#,
             &mut blocks,
             &mut turn,
+            &mut stats,
         )
         .unwrap();
         handle_stream_event(
-            &state,
-            "req",
-            "task",
             r#"{"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"hello"}}"#,
             &mut blocks,
             &mut turn,
+            &mut stats,
         )
         .unwrap();
         assert_eq!(turn.text, "hello");
         assert_eq!(blocks[0].text, "hello");
+        assert_eq!(stats.events, 2);
+        assert_eq!(stats.text_chars, 5);
     }
 
     #[test]
     fn parses_tool_stream_event() {
-        let state = AppState::new();
         let mut blocks = Vec::new();
         let mut turn = ClaudeTurn::default();
+        let mut stats = StreamEventStats::default();
         handle_stream_event(
-            &state,
-            "req",
-            "task",
             r#"{"type":"content_block_start","index":0,"content_block":{"type":"tool_use","id":"u1","name":"read_file","input":{}}}"#,
             &mut blocks,
             &mut turn,
+            &mut stats,
         )
         .unwrap();
         handle_stream_event(
-            &state,
-            "req",
-            "task",
             r#"{"type":"content_block_delta","index":0,"delta":{"type":"input_json_delta","partial_json":"{\"path\":\"Cargo.toml\"}"}}"#,
             &mut blocks,
             &mut turn,
+            &mut stats,
         )
         .unwrap();
         assert_eq!(blocks[0].name.as_deref(), Some("read_file"));
         assert!(blocks[0].input_json.contains("Cargo.toml"));
+        assert_eq!(stats.tool_uses, 1);
     }
 
     #[test]
@@ -1080,26 +1127,22 @@ mod tests {
 
     #[test]
     fn parses_cache_usage_from_stream_events() {
-        let state = AppState::new();
         let mut blocks = Vec::new();
         let mut turn = ClaudeTurn::default();
+        let mut stats = StreamEventStats::default();
 
         handle_stream_event(
-            &state,
-            "req",
-            "task",
             r#"{"type":"message_start","message":{"usage":{"input_tokens":1200,"cache_creation_input_tokens":1000,"cache_read_input_tokens":0}}}"#,
             &mut blocks,
             &mut turn,
+            &mut stats,
         )
         .unwrap();
         handle_stream_event(
-            &state,
-            "req",
-            "task",
             r#"{"type":"message_delta","usage":{"output_tokens":64}}"#,
             &mut blocks,
             &mut turn,
+            &mut stats,
         )
         .unwrap();
 
@@ -1107,6 +1150,7 @@ mod tests {
         assert_eq!(usage["cache_creation_input_tokens"], 1000);
         assert_eq!(usage["cache_read_input_tokens"], 0);
         assert_eq!(usage["output_tokens"], 64);
+        assert_eq!(stats.usage_events, 2);
     }
 
     #[test]

@@ -1,4 +1,5 @@
 import { describe, expect, it } from "vitest";
+import { formatTrend } from "./App";
 import { formatLogDetail, getLogCountForLevel, getVirtualLogWindow } from "./log-utils";
 import { maskSecretForDisplay } from "./ui-utils";
 
@@ -37,9 +38,9 @@ describe("log utilities", () => {
 
   it("keeps virtual page values non-negative after filtering or resize changes", () => {
     const window = getVirtualLogWindow(42 * 500, -20_132, 100);
-    expect(window.offset).toBe(100);
-    expect(window.limit).toBe(0);
-    expect(window.translateY).toBe(4_200);
+    expect(window.offset).toBe(99);
+    expect(window.limit).toBe(1);
+    expect(window.translateY).toBe(4_158);
   });
 
   it("ignores non-finite virtual list inputs", () => {
@@ -50,5 +51,16 @@ describe("log utilities", () => {
   it("formats detail lazily with truncation", () => {
     expect(formatLogDetail({ ok: true })).toContain('"ok": true');
     expect(formatLogDetail("abcdef", 3)).toContain("已截断显示");
+  });
+});
+
+describe("usage utilities", () => {
+  it("shows stable zero trend when yesterday has no data", () => {
+    expect(formatTrend(12_000, 0)).toBe("0%");
+  });
+
+  it("formats daily trend percentages", () => {
+    expect(formatTrend(150, 100)).toBe("+50.0%");
+    expect(formatTrend(75, 100)).toBe("-25.0%");
   });
 });

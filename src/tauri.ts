@@ -91,6 +91,21 @@ export interface TokenUsageSnapshot {
   updated_at?: string | null;
 }
 
+export interface RuntimeStatsSnapshot {
+  total_jobs: number;
+  queued_jobs: number;
+  running_jobs: number;
+  succeeded_jobs: number;
+  failed_jobs: number;
+  cancelled_jobs: number;
+  active_upstream_requests: number;
+  logs_retained: number;
+  logs_dropped: number;
+  logs_pending: number;
+  token_pending: number;
+  token_updated_at?: string | null;
+}
+
 type Unlisten = () => void;
 
 const mockConfig: AppConfig = {
@@ -139,6 +154,21 @@ const emptyLogPage: LogPage = {
   latest_id: null,
 };
 
+const emptyRuntimeStats: RuntimeStatsSnapshot = {
+  total_jobs: 0,
+  queued_jobs: 0,
+  running_jobs: 0,
+  succeeded_jobs: 0,
+  failed_jobs: 0,
+  cancelled_jobs: 0,
+  active_upstream_requests: 0,
+  logs_retained: 0,
+  logs_dropped: 0,
+  logs_pending: 0,
+  token_pending: 0,
+  token_updated_at: null,
+};
+
 function toPageNumber(value: number): number {
   return Math.max(0, Math.floor(Number.isFinite(value) ? value : 0));
 }
@@ -167,11 +197,14 @@ export const api = {
   startServer: () => invoke<ServerStatus>("start_mcp_server", undefined, () => mockStatus),
   stopServer: () => invoke<ServerStatus>("stop_mcp_server", undefined, () => mockStatus),
   getStatus: () => invoke<ServerStatus>("get_server_status", undefined, () => mockStatus),
-  getLogStats: () => invoke<LogStats>("get_log_stats", undefined, () => emptyLogStats),
-  getLogPage: (level: LogLevel | null, offset: number, limit: number) =>
+  getRuntimeStats: () =>
+    invoke<RuntimeStatsSnapshot>("get_runtime_stats", undefined, () => emptyRuntimeStats),
+  getLogStats: (query = "") =>
+    invoke<LogStats>("get_log_stats", { query }, () => emptyLogStats),
+  getLogPage: (level: LogLevel | null, offset: number, limit: number, query = "") =>
     invoke<LogPage>(
       "get_log_page",
-      { level, offset: toPageNumber(offset), limit: toPageNumber(limit) },
+      { level, offset: toPageNumber(offset), limit: toPageNumber(limit), query },
       () => emptyLogPage,
     ),
   getLogDetail: (id: number) =>
@@ -204,5 +237,9 @@ export const api = {
   onServerStatus: (handler: (status: ServerStatus) => void) =>
     isTauriRuntime()
       ? tauriListen<ServerStatus>("server-status-updated", (event) => handler(event.payload))
+      : Promise.resolve<Unlisten>(() => undefined),
+  onRuntimeStats: (handler: () => void) =>
+    isTauriRuntime()
+      ? tauriListen("runtime-stats-updated", () => handler())
       : Promise.resolve<Unlisten>(() => undefined),
 };

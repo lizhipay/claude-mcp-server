@@ -33,8 +33,9 @@ export function getVirtualLogWindow(
     1,
     Math.ceil(Math.max(safeViewportHeight, safeRowHeight) / safeRowHeight),
   );
+  const maxOffset = Math.max(0, safeTotal - visibleRows);
   const offset = Math.min(
-    safeTotal,
+    maxOffset,
     Math.max(0, Math.floor(safeScrollTop / safeRowHeight) - safeOverscan),
   );
   const limit = Math.max(0, Math.min(safeTotal - offset, visibleRows + safeOverscan * 2));

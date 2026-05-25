@@ -37,6 +37,7 @@ pub fn run() {
             commands::start_mcp_server,
             commands::stop_mcp_server,
             commands::get_server_status,
+            commands::get_runtime_stats,
             commands::get_log_stats,
             commands::get_log_page,
             commands::get_log_detail,

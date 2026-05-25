@@ -5,7 +5,7 @@ use crate::{
     config::{AppConfig, SaveConfigPayload},
     logs::{LogEntry, LogLevel, LogPage, LogStats},
     server::ServerStatus,
-    state::AppState,
+    state::{AppState, RuntimeStatsSnapshot},
     token_usage::TokenUsageSnapshot,
 };
 
@@ -78,8 +78,16 @@ pub async fn get_server_status(state: State<'_, AppState>) -> Result<ServerStatu
 }
 
 #[tauri::command]
-pub async fn get_log_stats(state: State<'_, AppState>) -> Result<LogStats, String> {
-    Ok(state.logs().stats())
+pub async fn get_runtime_stats(state: State<'_, AppState>) -> Result<RuntimeStatsSnapshot, String> {
+    Ok(state.runtime_stats())
+}
+
+#[tauri::command]
+pub async fn get_log_stats(
+    state: State<'_, AppState>,
+    query: Option<String>,
+) -> Result<LogStats, String> {
+    Ok(state.logs().stats(query.as_deref()))
 }
 
 #[tauri::command]
@@ -88,10 +96,11 @@ pub async fn get_log_page(
     level: Option<LogLevel>,
     offset: isize,
     limit: isize,
+    query: Option<String>,
 ) -> Result<LogPage, String> {
     let offset = usize::try_from(offset).unwrap_or(0);
     let limit = usize::try_from(limit).unwrap_or(0);
-    Ok(state.logs().page(level, offset, limit))
+    Ok(state.logs().page(level, offset, limit, query.as_deref()))
 }
 
 #[tauri::command]

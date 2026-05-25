@@ -47,7 +47,7 @@ xattr -dr com.apple.quarantine "/Applications/Claude MCP.app"
 | --- | --- | --- |
 | API 地址 | `https://api.anthropic.com` | 可以填根地址，也可以填完整 `/v1/messages` |
 | API Key | `sk-ant-...` | 保存到本机应用配置文件，不会在界面和日志里明文展示 |
-| 模型名称 | `claude-sonnet-4-7` | 默认值就是 `claude-sonnet-4-7` |
+| 模型名称 | `claude-opus-4-7` | 默认值就是 `claude-opus-4-7` |
 | 端口 | `8765` | 服务只监听 `127.0.0.1` |
 
 保存后点击“测试连接”。测试通过后点击“启动服务”，主控台会显示：
@@ -110,7 +110,17 @@ Claude MCP 对外提供这些工具：
 | `code_with_context_async` | `code_with_context_start` 的别名 |
 | `code_status` | 查询任务状态和最近输出 |
 | `code_result` | 读取已完成任务的最终结果 |
+| `code_wait` | 等待单个任务完成，超时才返回当前状态 |
+| `code_batch_wait` | 一次等待多个任务完成，减少频繁轮询 |
+| `code_batch_result` | 一次读取多个任务结果，不等待 |
 | `code_cancel` | 取消排队中或运行中的任务 |
+
+推荐用法：
+
+- 短任务直接用 `code`。
+- 长任务用 `code_start` 启动，再用 `code_wait` 等待结果。
+- 多任务并发用多个 `code_start` 启动，再用一次 `code_batch_wait` 等待结果。
+- 不建议让 Codex 每隔几秒反复调用 `code_status`，除非只是临时查看进度。
 
 任务状态包括：
 
@@ -158,36 +168,68 @@ cancelled
 }
 ```
 
-## 在 Codex 里怎么调用 Agent
+`code_wait` 参数：
 
-最稳定的写法是直接点名 `claude-mcp`，并说明工作目录。下面这些提示词可以直接复制到新 Codex 线程里测试。
-
-### 普通问答
-
-```text
-请优先使用 claude-mcp 的 code 工具回答，不要用内置 shell。
-
-问题：请用三句话解释 MCP Streamable HTTP 是什么。
-workdir 使用：/tmp
+```json
+{
+  "job_id": "返回的 job_id",
+  "timeout_seconds": 90,
+  "recent_chars": 8000
+}
 ```
 
-### 代码修改
+`code_batch_wait` 和 `code_batch_result` 参数：
+
+```json
+{
+  "job_ids": ["job_id_1", "job_id_2"],
+  "timeout_seconds": 90,
+  "recent_chars": 4000
+}
+```
+
+`code_wait` 和 `code_batch_wait` 是阻塞等待工具。它们内部使用任务完成通知，不是固定间隔轮询；任务完成会立刻返回，超时才返回当前状态。
+
+## 在 Codex 里怎么调用 Agent
+
+最稳定的写法是直接点名 `claude-mcp`，明确工作目录，并要求 Codex 使用等待型工具。下面这些提示词可以直接复制到新 Codex 线程里测试。
+
+### 快速连通测试
 
 ```text
-请优先调用 claude-mcp 的 code 工具完成任务。
+请只使用 claude-mcp，不要使用内置 shell。
+
+调用 claude-mcp 的 code 工具。
+
+workdir: /tmp
+
+任务：
+用三句话解释 MCP Streamable HTTP 是什么。
+```
+
+### 推荐的长任务写法
+
+```text
+请只使用 claude-mcp，不要使用内置 shell。
+
+调用 claude-mcp 的 code_start 启动任务，然后调用 code_wait 等待结果。
 
 workdir: /Users/zoe/Developer/ai/cclaude-mcp
+timeout_seconds: 120
 
 任务：
 1. 阅读当前项目结构。
-2. 找出 README.md 里可以改进的地方。
-3. 只返回建议，不要修改文件。
+2. 找出 MCP 工具实现的位置。
+3. 总结每个工具的用途、参数和适合的使用场景。
+4. 只返回总结，不要修改文件。
 ```
 
 ### 带上下文文件
 
 ```text
-请调用 claude-mcp 的 code_with_context 工具。
+请只使用 claude-mcp，不要使用内置 shell。
+
+调用 claude-mcp 的 code_with_context 工具。
 
 workdir: /Users/zoe/Developer/ai/cclaude-mcp
 files: ["README.md", "package.json"]
@@ -196,47 +238,76 @@ files: ["README.md", "package.json"]
 根据这两个文件，总结这个项目的启动方式、构建方式和发布方式。
 ```
 
-### 长任务轮询
+### 代码审查
 
 ```text
-请使用 claude-mcp 的 code_start 启动任务。
+请只使用 claude-mcp，不要使用内置 shell。
+
+调用 claude-mcp 的 code_start 启动任务，然后调用 code_wait 等待结果。
 
 workdir: /Users/zoe/Developer/ai/cclaude-mcp
+timeout_seconds: 180
 
 任务：
-检查项目里 MCP 工具的实现，说明每个工具的参数和使用场景。
-
-启动后请每 10 秒调用 code_status 查询进度，完成后调用 code_result 返回最终结果。
+请做一次代码审查，只列出真实风险：
+1. 优先找会导致运行失败、数据错误、并发问题或测试缺口的点。
+2. 每个问题都要给出文件路径和原因。
+3. 如果没有发现问题，明确说没有发现阻塞级问题。
+4. 不要修改文件。
 ```
 
 ### 读写文件和命令执行测试
 
 ```text
-请只使用 claude-mcp，不要用 Codex 内置 shell。
+请只使用 claude-mcp，不要使用内置 shell。
 
-调用 claude-mcp 的 code_start，在 workdir=/tmp/claude-mcp-smoke-test 下完成：
+调用 claude-mcp 的 code_start 启动任务，然后调用 code_wait 等待结果。
+
+workdir: /tmp/claude-mcp-smoke-test
+timeout_seconds: 120
+
+任务：
 1. 创建一个最小 Node.js 项目。
 2. 写一个 add(a, b) 函数。
 3. 写一个测试文件验证 add(2, 3) 等于 5。
 4. 运行测试。
 5. 返回创建的文件列表、测试命令和测试结果。
-
-启动后请用 code_status 轮询，完成后用 code_result 读取结果。
 ```
 
-### 并发测试
+### 并发批量任务
 
 ```text
-请用 claude-mcp 的 code_start 连续启动 5 个任务。
+请只使用 claude-mcp，不要使用内置 shell。
 
-每个任务都使用 workdir=/tmp，并分别回答：
-任务 1：返回 JSON {"task":1,"ok":true}
-任务 2：返回 JSON {"task":2,"ok":true}
-任务 3：返回 JSON {"task":3,"ok":true}
-任务 4：返回 JSON {"task":4,"ok":true}
-任务 5：返回 JSON {"task":5,"ok":true}
+请用 claude-mcp 的 code_start 连续启动 5 个任务，每个任务都使用 workdir=/tmp。
 
-启动后分别调用 code_status，全部完成后调用 code_result，并汇总每个任务的结果。
+任务 1：等待 10 秒后返回 JSON {"task":1,"ok":true}
+任务 2：等待 10 秒后返回 JSON {"task":2,"ok":true}
+任务 3：等待 10 秒后返回 JSON {"task":3,"ok":true}
+任务 4：等待 10 秒后返回 JSON {"task":4,"ok":true}
+任务 5：等待 10 秒后返回 JSON {"task":5,"ok":true}
+
+全部启动后，只调用一次 code_batch_wait。
+timeout_seconds 设置为 60。
+最后汇总每个任务的结果。
+```
+
+### 大任务分工
+
+```text
+请只使用 claude-mcp，不要使用内置 shell。
+
+目标项目：
+workdir: /Users/zoe/Developer/ai/cclaude-mcp
+
+请把下面工作拆成 3 个 claude-mcp 任务并发执行，每个任务用 code_start 启动：
+1. 阅读 README.md，找出使用教程是否清楚。
+2. 阅读 src-tauri/src/mcp.rs，整理 MCP 工具列表和参数。
+3. 阅读 src-tauri/src/jobs.rs，说明异步任务和等待机制。
+
+三个任务都不要修改文件。
+全部启动后，只调用一次 code_batch_wait，timeout_seconds 设置为 120。
+最后合并三个结果，输出一份简洁总结。
 ```
 
 ## Claude Agent 能使用的本地能力

@@ -11,6 +11,11 @@ use tokio::fs;
 
 use crate::{claude, logs::LogLevel, state::AppState};
 
+const DEFAULT_WAIT_SECONDS: u64 = 90;
+const MAX_WAIT_SECONDS: u64 = 600;
+const MAX_BATCH_JOB_IDS: usize = 100;
+const DEFAULT_BATCH_RECENT_CHARS: usize = 4_000;
+
 #[derive(Clone)]
 pub struct ClaudeMcpService {
     state: AppState,
@@ -45,6 +50,26 @@ pub struct StatusRequest {
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub struct ResultRequest {
     pub job_id: String,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct WaitRequest {
+    pub job_id: String,
+    pub timeout_seconds: Option<u64>,
+    pub recent_chars: Option<usize>,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct BatchWaitRequest {
+    pub job_ids: Vec<String>,
+    pub timeout_seconds: Option<u64>,
+    pub recent_chars: Option<usize>,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct BatchResultRequest {
+    pub job_ids: Vec<String>,
+    pub recent_chars: Option<usize>,
 }
 
 impl ClaudeMcpService {
@@ -173,10 +198,60 @@ impl ClaudeMcpService {
         }
     }
 
+    #[tool(
+        description = "Wait for one Claude job to finish, returning grouped job state and result."
+    )]
+    async fn code_wait(&self, Parameters(req): Parameters<WaitRequest>) -> CallToolResult {
+        let job_ids = match validate_batch_job_ids(vec![req.job_id]) {
+            Ok(job_ids) => job_ids,
+            Err(error) => return CallToolResult::structured_error(json!({"error": error})),
+        };
+        let timeout = wait_duration(req.timeout_seconds);
+        let recent_chars = req.recent_chars.unwrap_or(8_000);
+        let result = self
+            .state
+            .jobs()
+            .wait_batch_for(&job_ids, timeout, recent_chars)
+            .await;
+        CallToolResult::structured(result)
+    }
+
+    #[tool(description = "Wait for multiple Claude jobs to finish and return grouped results.")]
+    async fn code_batch_wait(
+        &self,
+        Parameters(req): Parameters<BatchWaitRequest>,
+    ) -> CallToolResult {
+        let job_ids = match validate_batch_job_ids(req.job_ids) {
+            Ok(job_ids) => job_ids,
+            Err(error) => return CallToolResult::structured_error(json!({"error": error})),
+        };
+        let timeout = wait_duration(req.timeout_seconds);
+        let recent_chars = req.recent_chars.unwrap_or(DEFAULT_BATCH_RECENT_CHARS);
+        let result = self
+            .state
+            .jobs()
+            .wait_batch_for(&job_ids, timeout, recent_chars)
+            .await;
+        CallToolResult::structured(result)
+    }
+
+    #[tool(description = "Fetch grouped results for multiple Claude jobs without waiting.")]
+    fn code_batch_result(&self, Parameters(req): Parameters<BatchResultRequest>) -> CallToolResult {
+        let job_ids = match validate_batch_job_ids(req.job_ids) {
+            Ok(job_ids) => job_ids,
+            Err(error) => return CallToolResult::structured_error(json!({"error": error})),
+        };
+        let recent_chars = req.recent_chars.unwrap_or(DEFAULT_BATCH_RECENT_CHARS);
+        CallToolResult::structured(self.state.jobs().batch_result(&job_ids, recent_chars))
+    }
+
     #[tool(description = "Cancel a queued or running Claude job.")]
     fn code_cancel(&self, Parameters(req): Parameters<ResultRequest>) -> CallToolResult {
         match self.state.jobs().cancel(&req.job_id) {
-            Some(summary) => structured(summary),
+            Some(summary) => {
+                self.state.notify_runtime_stats_changed();
+                structured(summary)
+            }
             None => CallToolResult::structured_error(json!({
                 "job_id": req.job_id,
                 "status": "not_found",
@@ -192,6 +267,29 @@ impl ServerHandler for ClaudeMcpService {
         ServerInfo::new(ServerCapabilities::builder().enable_tools().build())
             .with_instructions("Use this server to delegate coding tasks to Claude without installing Claude Code CLI.")
     }
+}
+
+fn wait_duration(timeout_seconds: Option<u64>) -> std::time::Duration {
+    std::time::Duration::from_secs(
+        timeout_seconds
+            .unwrap_or(DEFAULT_WAIT_SECONDS)
+            .clamp(1, MAX_WAIT_SECONDS),
+    )
+}
+
+fn validate_batch_job_ids(job_ids: Vec<String>) -> Result<Vec<String>, String> {
+    let job_ids: Vec<String> = job_ids
+        .into_iter()
+        .map(|job_id| job_id.trim().to_string())
+        .filter(|job_id| !job_id.is_empty())
+        .collect();
+    if job_ids.is_empty() {
+        return Err("job_ids 不能为空".to_string());
+    }
+    if job_ids.len() > MAX_BATCH_JOB_IDS {
+        return Err(format!("一次最多等待 {MAX_BATCH_JOB_IDS} 个任务"));
+    }
+    Ok(job_ids)
 }
 
 fn structured<T: serde::Serialize>(value: T) -> CallToolResult {
