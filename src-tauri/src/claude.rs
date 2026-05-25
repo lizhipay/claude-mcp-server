@@ -665,8 +665,14 @@ async fn execute_local_tool(
             "tool",
             None,
             Some(task_id.to_string()),
-            format!("本地工具 {} 失败", tool_use.name),
-            Some(json!({"tool": tool_use.name, "error": error.to_string()})),
+            format!("本地工具 {} 失败：{}", tool_use.name, error),
+            Some(json!({
+                "tool": tool_use.name,
+                "workdir": cwd,
+                "input": tool_use.input,
+                "elapsed_ms": started.elapsed().as_millis(),
+                "error": error.to_string()
+            })),
         ),
     };
     result
@@ -1158,6 +1164,81 @@ mod tests {
         assert_eq!(minimum_cacheable_tokens("claude-opus-4-7"), 4096);
         assert_eq!(minimum_cacheable_tokens("claude-haiku-3-5"), 2048);
         assert_eq!(minimum_cacheable_tokens("claude-sonnet-4-7"), 1024);
+    }
+
+    #[tokio::test]
+    async fn tool_failure_log_includes_error_summary_and_detail() {
+        let state = AppState::new();
+        let root = tempfile::tempdir().unwrap();
+        let cwd = root.path().to_path_buf();
+        let tool_use = ToolUse {
+            id: "tool-1".to_string(),
+            name: "list_dir".to_string(),
+            input: json!({"path": "missing"}),
+        };
+
+        let error =
+            execute_local_tool(&state, &cwd, "task-1", &tool_use, &CancellationToken::new())
+                .await
+                .unwrap_err();
+
+        let page = state.logs().page(Some(LogLevel::Error), 0, 10, None);
+        assert_eq!(page.total, 1);
+        let entry = &page.entries[0];
+        assert!(entry.summary.starts_with("本地工具 list_dir 失败："));
+        assert!(entry.summary.contains(&error.to_string()));
+
+        let detail = state.logs().detail(entry.id).unwrap().detail.unwrap();
+        assert_eq!(detail["tool"], "list_dir");
+        assert_eq!(detail["input"]["path"], "missing");
+        assert_eq!(detail["workdir"], cwd.display().to_string());
+        assert!(!detail["error"].as_str().unwrap().is_empty());
+        assert!(detail["elapsed_ms"].is_u64());
+    }
+
+    #[tokio::test]
+    async fn run_command_missing_command_logs_diagnostic_detail() {
+        let state = AppState::new();
+        let root = tempfile::tempdir().unwrap();
+        let cwd = root.path().to_path_buf();
+        let tool_use = ToolUse {
+            id: "tool-2".to_string(),
+            name: "run_command".to_string(),
+            input: json!({}),
+        };
+
+        execute_local_tool(&state, &cwd, "task-2", &tool_use, &CancellationToken::new())
+            .await
+            .unwrap_err();
+
+        let page = state.logs().page(Some(LogLevel::Error), 0, 10, None);
+        assert_eq!(page.total, 1);
+        let entry = &page.entries[0];
+        assert!(entry.summary.contains("缺少参数：command"));
+
+        let detail = state.logs().detail(entry.id).unwrap().detail.unwrap();
+        assert_eq!(detail["tool"], "run_command");
+        assert_eq!(detail["workdir"], cwd.display().to_string());
+        assert_eq!(detail["input"], json!({}));
+    }
+
+    #[tokio::test]
+    async fn run_command_non_zero_exit_returns_output_instead_of_tool_error() {
+        let root = tempfile::tempdir().unwrap();
+        #[cfg(target_os = "windows")]
+        let command = "exit /B 1";
+        #[cfg(not(target_os = "windows"))]
+        let command = "exit 1";
+
+        let output = run_command(
+            &root.path().to_path_buf(),
+            &json!({"command": command, "timeout_seconds": 5}),
+            &CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+
+        assert!(output.contains("exit_code: Some(1)"));
     }
 
     #[test]

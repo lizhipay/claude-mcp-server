@@ -113,13 +113,14 @@ Claude MCP 对外提供这些工具：
 | `code_wait` | 等待单个任务完成，超时才返回当前状态 |
 | `code_batch_wait` | 一次等待多个任务完成，减少频繁轮询 |
 | `code_batch_result` | 一次读取多个任务结果，不等待 |
+| `code_batch_poll` | 增量读取多个任务的新完成结果 |
 | `code_cancel` | 取消排队中或运行中的任务 |
 
 推荐用法：
 
 - 短任务直接用 `code`。
 - 长任务用 `code_start` 启动，再用 `code_wait` 等待结果。
-- 多任务并发用多个 `code_start` 启动，再用一次 `code_batch_wait` 等待结果。
+- 多任务并发用多个 `code_start` 启动；想一次等完用 `code_batch_wait`，想边完成边处理用 `code_batch_poll`。
 - 不建议让 Codex 每隔几秒反复调用 `code_status`，除非只是临时查看进度。
 
 任务状态包括：
@@ -178,7 +179,7 @@ cancelled
 }
 ```
 
-`code_batch_wait` 和 `code_batch_result` 参数：
+`code_batch_wait` 参数：
 
 ```json
 {
@@ -188,7 +189,32 @@ cancelled
 }
 ```
 
+`code_batch_result` 参数：
+
+```json
+{
+  "job_ids": ["job_id_1", "job_id_2"],
+  "recent_chars": 4000
+}
+```
+
+`code_batch_poll` 参数：
+
+```json
+{
+  "job_ids": ["job_id_1", "job_id_2"],
+  "seen_job_ids": [],
+  "timeout_seconds": 3,
+  "recent_chars": 4000,
+  "include_running": false
+}
+```
+
 `code_wait` 和 `code_batch_wait` 是阻塞等待工具。它们内部使用任务完成通知，不是固定间隔轮询；任务完成会立刻返回，超时才返回当前状态。
+
+`code_batch_poll` 用于批量任务的增量读取：每次只返回还没处理过的完成、失败、取消或找不到的任务。Codex 需要把返回的 `next_seen_job_ids` 保存下来，下次作为 `seen_job_ids` 继续传入。
+
+`code_batch_poll` 一次最多接收 500 个 `job_id`，适合几百个并发任务分批读取。
 
 ## 在 Codex 里怎么调用 Agent
 
@@ -287,9 +313,17 @@ timeout_seconds: 120
 任务 4：等待 10 秒后返回 JSON {"task":4,"ok":true}
 任务 5：等待 10 秒后返回 JSON {"task":5,"ok":true}
 
-全部启动后，只调用一次 code_batch_wait。
-timeout_seconds 设置为 60。
-最后汇总每个任务的结果。
+维护 seen_job_ids = []。
+全部启动后，每 3 秒调用一次 code_batch_poll：
+{
+  "job_ids": ["上面 5 个 job_id"],
+  "seen_job_ids": seen_job_ids,
+  "timeout_seconds": 3,
+  "recent_chars": 4000
+}
+每次处理 completed / failed / cancelled / not_found。
+把返回的 next_seen_job_ids 保存为新的 seen_job_ids。
+当 complete=true 时停止读取并输出最终汇总。
 ```
 
 ### 大任务分工
@@ -306,8 +340,9 @@ workdir: /Users/zoe/Developer/ai/cclaude-mcp
 3. 阅读 src-tauri/src/jobs.rs，说明异步任务和等待机制。
 
 三个任务都不要修改文件。
-全部启动后，只调用一次 code_batch_wait，timeout_seconds 设置为 120。
-最后合并三个结果，输出一份简洁总结。
+全部启动后，用 code_batch_poll 每 3 秒增量读取一次。
+每次处理新完成的任务，并把 next_seen_job_ids 保存为下一次的 seen_job_ids。
+当 complete=true 时停止读取，合并三个结果，输出一份简洁总结。
 ```
 
 ## Claude Agent 能使用的本地能力

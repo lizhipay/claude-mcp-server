@@ -1,4 +1,5 @@
 use std::{
+    collections::HashSet,
     path::PathBuf,
     sync::{
         atomic::{AtomicI64, Ordering},
@@ -306,6 +307,55 @@ impl JobStore {
         }
     }
 
+    pub async fn poll_batch_for(
+        &self,
+        job_ids: &[String],
+        seen_job_ids: &[String],
+        timeout: Duration,
+        recent_chars: usize,
+        include_running: bool,
+    ) -> Value {
+        let deadline = tokio::time::Instant::now() + timeout;
+        loop {
+            let snapshot =
+                self.batch_poll_result(job_ids, seen_job_ids, recent_chars, include_running);
+            if snapshot
+                .get("ready_count")
+                .and_then(Value::as_u64)
+                .unwrap_or(0)
+                > 0
+                || snapshot
+                    .get("complete")
+                    .and_then(Value::as_bool)
+                    .unwrap_or(false)
+            {
+                return snapshot;
+            }
+
+            let now = tokio::time::Instant::now();
+            if now >= deadline {
+                return snapshot;
+            }
+
+            let waiters = self.incomplete_waiters(job_ids);
+            if waiters.is_empty() {
+                return self.batch_poll_result(
+                    job_ids,
+                    seen_job_ids,
+                    recent_chars,
+                    include_running,
+                );
+            }
+
+            tokio::select! {
+                _ = tokio::time::sleep_until(deadline) => {
+                    return self.batch_poll_result(job_ids, seen_job_ids, recent_chars, include_running);
+                }
+                _ = select_all(waiters) => {}
+            }
+        }
+    }
+
     pub fn batch_result(&self, job_ids: &[String], recent_chars: usize) -> Value {
         let mut completed = Vec::new();
         let mut running = Vec::new();
@@ -334,6 +384,77 @@ impl JobStore {
             "cancelled": cancelled,
             "not_found": not_found
         })
+    }
+
+    pub fn batch_poll_result(
+        &self,
+        job_ids: &[String],
+        seen_job_ids: &[String],
+        recent_chars: usize,
+        include_running: bool,
+    ) -> Value {
+        let job_id_set: HashSet<&str> = job_ids.iter().map(String::as_str).collect();
+        let seen_set: HashSet<&str> = seen_job_ids.iter().map(String::as_str).collect();
+        let mut next_seen_set = HashSet::new();
+        let mut next_seen_job_ids = Vec::new();
+        for job_id in seen_job_ids
+            .iter()
+            .filter(|job_id| job_id_set.contains(job_id.as_str()))
+        {
+            if next_seen_set.insert(job_id.clone()) {
+                next_seen_job_ids.push(job_id.clone());
+            }
+        }
+
+        let mut completed = Vec::new();
+        let mut failed = Vec::new();
+        let mut cancelled = Vec::new();
+        let mut not_found = Vec::new();
+        let mut running = Vec::new();
+        let mut running_count = 0usize;
+        let mut ready_count = 0usize;
+
+        for job_id in job_ids {
+            let item = self.job_item(job_id, recent_chars);
+            let status = item.get("status").and_then(Value::as_str).unwrap_or("");
+            let is_terminal = matches!(status, "succeeded" | "failed" | "cancelled" | "not_found");
+
+            if is_terminal {
+                if !seen_set.contains(job_id.as_str()) {
+                    ready_count += 1;
+                    match status {
+                        "succeeded" => completed.push(item),
+                        "failed" => failed.push(item),
+                        "cancelled" => cancelled.push(item),
+                        "not_found" => not_found.push(item),
+                        _ => {}
+                    }
+                }
+                if next_seen_set.insert(job_id.clone()) {
+                    next_seen_job_ids.push(job_id.clone());
+                }
+            } else {
+                running_count += 1;
+                if include_running {
+                    running.push(item);
+                }
+            }
+        }
+
+        let mut result = serde_json::Map::new();
+        result.insert("total".to_string(), json!(job_ids.len()));
+        result.insert("complete".to_string(), json!(running_count == 0));
+        result.insert("running_count".to_string(), json!(running_count));
+        result.insert("ready_count".to_string(), json!(ready_count));
+        result.insert("completed".to_string(), json!(completed));
+        result.insert("failed".to_string(), json!(failed));
+        result.insert("cancelled".to_string(), json!(cancelled));
+        result.insert("not_found".to_string(), json!(not_found));
+        result.insert("next_seen_job_ids".to_string(), json!(next_seen_job_ids));
+        if include_running {
+            result.insert("running".to_string(), json!(running));
+        }
+        Value::Object(result)
     }
 
     pub fn stats(&self) -> JobStoreStats {
@@ -682,5 +803,138 @@ mod tests {
         assert_eq!(result["failed"][0]["error"], "boom");
         assert_eq!(result["cancelled"][0]["status"], "cancelled");
         assert_eq!(result["not_found"][0]["job_id"], "missing");
+    }
+
+    #[tokio::test]
+    async fn poll_batch_returns_unseen_completed_immediately() {
+        let store = JobStore::default();
+        {
+            let entry = insert_job(&store, "done", JobStatus::Succeeded, Some(1));
+            entry.record.lock().expect("job poisoned").output = "ok".to_string();
+        }
+
+        let started = tokio::time::Instant::now();
+        let result = store
+            .poll_batch_for(
+                &["done".to_string()],
+                &[],
+                Duration::from_secs(2),
+                100,
+                false,
+            )
+            .await;
+
+        assert!(started.elapsed() < Duration::from_secs(1));
+        assert_eq!(result["complete"], true);
+        assert_eq!(result["ready_count"], 1);
+        assert_eq!(result["completed"][0]["result"], "ok");
+        assert_eq!(result["next_seen_job_ids"][0], "done");
+        assert!(result.get("running").is_none());
+    }
+
+    #[tokio::test]
+    async fn poll_batch_skips_seen_terminal_jobs() {
+        let store = JobStore::default();
+        insert_job(&store, "done", JobStatus::Succeeded, Some(1));
+
+        let result = store
+            .poll_batch_for(
+                &["done".to_string()],
+                &["done".to_string()],
+                Duration::from_secs(2),
+                100,
+                false,
+            )
+            .await;
+
+        assert_eq!(result["complete"], true);
+        assert_eq!(result["ready_count"], 0);
+        assert_eq!(result["completed"].as_array().unwrap().len(), 0);
+        assert_eq!(result["next_seen_job_ids"][0], "done");
+    }
+
+    #[tokio::test]
+    async fn poll_batch_times_out_without_new_completed_jobs() {
+        let store = JobStore::default();
+        insert_job(&store, "running", JobStatus::Running, None);
+
+        let result = store
+            .poll_batch_for(
+                &["running".to_string()],
+                &[],
+                Duration::from_millis(20),
+                100,
+                true,
+            )
+            .await;
+
+        assert_eq!(result["complete"], false);
+        assert_eq!(result["ready_count"], 0);
+        assert_eq!(result["running_count"], 1);
+        assert_eq!(result["running"][0]["job_id"], "running");
+    }
+
+    #[tokio::test]
+    async fn poll_batch_returns_when_running_job_is_notified() {
+        let store = Arc::new(JobStore::default());
+        let entry = insert_job(&store, "job-1", JobStatus::Running, None);
+        let record = entry.record.clone();
+        let notify = entry.notify.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+            let mut job = record.lock().expect("job poisoned");
+            job.status = JobStatus::Succeeded;
+            job.ended_at = Some(Utc::now().timestamp_millis());
+            job.output = "done".to_string();
+            drop(job);
+            notify.notify_waiters();
+        });
+
+        let started = tokio::time::Instant::now();
+        let result = store
+            .poll_batch_for(
+                &["job-1".to_string()],
+                &[],
+                Duration::from_secs(2),
+                100,
+                false,
+            )
+            .await;
+
+        assert!(started.elapsed() < Duration::from_secs(1));
+        assert_eq!(result["complete"], true);
+        assert_eq!(result["ready_count"], 1);
+        assert_eq!(result["completed"][0]["result"], "done");
+    }
+
+    #[test]
+    fn poll_batch_groups_failed_cancelled_and_not_found() {
+        let store = JobStore::default();
+        {
+            let entry = insert_job(&store, "failed", JobStatus::Failed, Some(1));
+            entry.record.lock().expect("job poisoned").error = Some("boom".to_string());
+        }
+        insert_job(&store, "cancelled", JobStatus::Cancelled, Some(2));
+
+        let result = store.batch_poll_result(
+            &[
+                "failed".to_string(),
+                "cancelled".to_string(),
+                "missing".to_string(),
+            ],
+            &[],
+            100,
+            false,
+        );
+
+        assert_eq!(result["complete"], true);
+        assert_eq!(result["ready_count"], 3);
+        assert_eq!(result["failed"][0]["error"], "boom");
+        assert_eq!(result["cancelled"][0]["job_id"], "cancelled");
+        assert_eq!(result["not_found"][0]["job_id"], "missing");
+        assert_eq!(
+            result["next_seen_job_ids"],
+            json!(["failed", "cancelled", "missing"])
+        );
     }
 }

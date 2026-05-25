@@ -265,6 +265,10 @@ mod tests {
             tool_names.contains(&"code_batch_result".to_string()),
             "tools: {tool_names:?}"
         );
+        assert!(
+            tool_names.contains(&"code_batch_poll".to_string()),
+            "tools: {tool_names:?}"
+        );
 
         let call = post_mcp(
             &client,
@@ -301,6 +305,27 @@ mod tests {
         assert_eq!(batch["result"]["structuredContent"]["total"], 1);
         assert_eq!(
             batch["result"]["structuredContent"]["not_found"][0]["job_id"],
+            "missing"
+        );
+
+        let poll = post_mcp(
+            &client,
+            &mcp_url,
+            json!({
+                "jsonrpc": "2.0",
+                "id": 5,
+                "method": "tools/call",
+                "params": {
+                    "name": "code_batch_poll",
+                    "arguments": {"job_ids": ["missing"], "timeout_seconds": 0}
+                }
+            }),
+        )
+        .await;
+        assert_eq!(poll["id"], 5);
+        assert_eq!(poll["result"]["structuredContent"]["ready_count"], 1);
+        assert_eq!(
+            poll["result"]["structuredContent"]["not_found"][0]["job_id"],
             "missing"
         );
 

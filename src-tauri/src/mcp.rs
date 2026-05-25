@@ -1,4 +1,4 @@
-use std::path::PathBuf;
+use std::{io::ErrorKind, path::PathBuf};
 
 use rmcp::{
     handler::server::{router::tool::ToolRouter, wrapper::Parameters},
@@ -12,8 +12,10 @@ use tokio::fs;
 use crate::{claude, logs::LogLevel, state::AppState};
 
 const DEFAULT_WAIT_SECONDS: u64 = 90;
+const DEFAULT_POLL_SECONDS: u64 = 3;
 const MAX_WAIT_SECONDS: u64 = 600;
 const MAX_BATCH_JOB_IDS: usize = 100;
+const MAX_POLL_JOB_IDS: usize = 500;
 const DEFAULT_BATCH_RECENT_CHARS: usize = 4_000;
 
 #[derive(Clone)]
@@ -72,6 +74,15 @@ pub struct BatchResultRequest {
     pub recent_chars: Option<usize>,
 }
 
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct BatchPollRequest {
+    pub job_ids: Vec<String>,
+    pub seen_job_ids: Option<Vec<String>>,
+    pub timeout_seconds: Option<u64>,
+    pub recent_chars: Option<usize>,
+    pub include_running: Option<bool>,
+}
+
 impl ClaudeMcpService {
     pub fn new(state: AppState) -> Self {
         Self {
@@ -87,7 +98,10 @@ impl ClaudeMcpService {
         description = "Send a coding task to Claude and return the response. If it runs longer than about 90 seconds, this returns a job_id."
     )]
     async fn code(&self, Parameters(req): Parameters<CodeRequest>) -> String {
-        let cwd = workdir_or_current(req.workdir);
+        let cwd = match self.prepare_workdir(req.workdir, "code").await {
+            Ok(cwd) => cwd,
+            Err(error) => return format!("[workdir error]\n{error}"),
+        };
         self.state.logs().push(
             LogLevel::Info,
             "mcp",
@@ -109,7 +123,10 @@ impl ClaudeMcpService {
         &self,
         Parameters(req): Parameters<CodeWithContextRequest>,
     ) -> String {
-        let cwd = workdir_or_current(req.workdir);
+        let cwd = match self.prepare_workdir(req.workdir, "code_with_context").await {
+            Ok(cwd) => cwd,
+            Err(error) => return format!("[workdir error]\n{error}"),
+        };
         match build_context_prompt(&cwd, &req.files, &req.prompt).await {
             Ok(prompt) => {
                 self.state.logs().push(
@@ -131,7 +148,10 @@ impl ClaudeMcpService {
 
     #[tool(description = "Start a Claude coding job and return immediately with a job_id.")]
     async fn code_start(&self, Parameters(req): Parameters<CodeRequest>) -> CallToolResult {
-        let cwd = workdir_or_current(req.workdir);
+        let cwd = match self.prepare_workdir(req.workdir, "code_start").await {
+            Ok(cwd) => cwd,
+            Err(error) => return CallToolResult::structured_error(json!({"error": error})),
+        };
         let summary = self
             .state
             .jobs()
@@ -144,7 +164,13 @@ impl ClaudeMcpService {
         &self,
         Parameters(req): Parameters<CodeWithContextRequest>,
     ) -> CallToolResult {
-        let cwd = workdir_or_current(req.workdir);
+        let cwd = match self
+            .prepare_workdir(req.workdir, "code_with_context_start")
+            .await
+        {
+            Ok(cwd) => cwd,
+            Err(error) => return CallToolResult::structured_error(json!({"error": error})),
+        };
         match build_context_prompt(&cwd, &req.files, &req.prompt).await {
             Ok(prompt) => {
                 let summary = self.state.jobs().start_job(self.state.clone(), prompt, cwd);
@@ -245,6 +271,35 @@ impl ClaudeMcpService {
         CallToolResult::structured(self.state.jobs().batch_result(&job_ids, recent_chars))
     }
 
+    #[tool(
+        description = "Poll multiple Claude jobs and return only newly completed, failed, cancelled, or missing results."
+    )]
+    async fn code_batch_poll(
+        &self,
+        Parameters(req): Parameters<BatchPollRequest>,
+    ) -> CallToolResult {
+        let job_ids = match validate_job_ids(req.job_ids, MAX_POLL_JOB_IDS) {
+            Ok(job_ids) => job_ids,
+            Err(error) => return CallToolResult::structured_error(json!({"error": error})),
+        };
+        let seen_job_ids = normalize_job_ids(req.seen_job_ids.unwrap_or_default());
+        let timeout = poll_duration(req.timeout_seconds);
+        let recent_chars = req.recent_chars.unwrap_or(DEFAULT_BATCH_RECENT_CHARS);
+        let include_running = req.include_running.unwrap_or(false);
+        let result = self
+            .state
+            .jobs()
+            .poll_batch_for(
+                &job_ids,
+                &seen_job_ids,
+                timeout,
+                recent_chars,
+                include_running,
+            )
+            .await;
+        CallToolResult::structured(result)
+    }
+
     #[tool(description = "Cancel a queued or running Claude job.")]
     fn code_cancel(&self, Parameters(req): Parameters<ResultRequest>) -> CallToolResult {
         match self.state.jobs().cancel(&req.job_id) {
@@ -258,6 +313,14 @@ impl ClaudeMcpService {
                 "error": "Unknown job_id"
             })),
         }
+    }
+
+    async fn prepare_workdir(
+        &self,
+        workdir: Option<String>,
+        tool_name: &str,
+    ) -> Result<PathBuf, String> {
+        prepare_workdir(&self.state, workdir, tool_name).await
     }
 }
 
@@ -277,19 +340,38 @@ fn wait_duration(timeout_seconds: Option<u64>) -> std::time::Duration {
     )
 }
 
+fn poll_duration(timeout_seconds: Option<u64>) -> std::time::Duration {
+    std::time::Duration::from_secs(
+        timeout_seconds
+            .unwrap_or(DEFAULT_POLL_SECONDS)
+            .min(MAX_WAIT_SECONDS),
+    )
+}
+
 fn validate_batch_job_ids(job_ids: Vec<String>) -> Result<Vec<String>, String> {
+    validate_job_ids(job_ids, MAX_BATCH_JOB_IDS)
+}
+
+fn validate_job_ids(job_ids: Vec<String>, max: usize) -> Result<Vec<String>, String> {
+    let job_ids = normalize_job_ids(job_ids);
+    if job_ids.is_empty() {
+        return Err("job_ids 不能为空".to_string());
+    }
+    if job_ids.len() > max {
+        return Err(format!("一次最多处理 {max} 个任务"));
+    }
+    Ok(job_ids)
+}
+
+fn normalize_job_ids(job_ids: Vec<String>) -> Vec<String> {
+    let mut seen = std::collections::HashSet::new();
     let job_ids: Vec<String> = job_ids
         .into_iter()
         .map(|job_id| job_id.trim().to_string())
         .filter(|job_id| !job_id.is_empty())
+        .filter(|job_id| seen.insert(job_id.clone()))
         .collect();
-    if job_ids.is_empty() {
-        return Err("job_ids 不能为空".to_string());
-    }
-    if job_ids.len() > MAX_BATCH_JOB_IDS {
-        return Err(format!("一次最多等待 {MAX_BATCH_JOB_IDS} 个任务"));
-    }
-    Ok(job_ids)
+    job_ids
 }
 
 fn structured<T: serde::Serialize>(value: T) -> CallToolResult {
@@ -306,6 +388,55 @@ fn workdir_or_current(workdir: Option<String>) -> PathBuf {
         .map(PathBuf::from)
         .or_else(|| std::env::current_dir().ok())
         .unwrap_or_else(|| PathBuf::from("."))
+}
+
+async fn prepare_workdir(
+    state: &AppState,
+    workdir: Option<String>,
+    tool_name: &str,
+) -> Result<PathBuf, String> {
+    let cwd = workdir_or_current(workdir);
+    match fs::metadata(&cwd).await {
+        Ok(metadata) if metadata.is_dir() => Ok(cwd),
+        Ok(_) => {
+            let error = format!("workdir 不是目录：{}", cwd.display());
+            state.logs().push(
+                LogLevel::Error,
+                "mcp",
+                None,
+                None,
+                error.clone(),
+                Some(json!({"tool": tool_name, "workdir": cwd})),
+            );
+            Err(error)
+        }
+        Err(error) if error.kind() == ErrorKind::NotFound => {
+            fs::create_dir_all(&cwd).await.map_err(|create_error| {
+                format!("无法创建 workdir {}：{}", cwd.display(), create_error)
+            })?;
+            state.logs().push(
+                LogLevel::Info,
+                "mcp",
+                None,
+                None,
+                "自动创建 workdir",
+                Some(json!({"tool": tool_name, "workdir": cwd})),
+            );
+            Ok(cwd)
+        }
+        Err(error) => {
+            let error = format!("无法访问 workdir {}：{}", cwd.display(), error);
+            state.logs().push(
+                LogLevel::Error,
+                "mcp",
+                None,
+                None,
+                error.clone(),
+                Some(json!({"tool": tool_name, "workdir": cwd})),
+            );
+            Err(error)
+        }
+    }
 }
 
 async fn build_context_prompt(
@@ -331,4 +462,44 @@ async fn build_context_prompt(
         ));
     }
     Ok(format!("{}\n\n{}", blocks.join("\n"), prompt))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn prepare_workdir_creates_missing_directory() {
+        let state = AppState::new();
+        let root = tempfile::tempdir().unwrap();
+        let cwd = root.path().join("new-project").join("nested");
+
+        let prepared = prepare_workdir(&state, Some(cwd.display().to_string()), "code_start")
+            .await
+            .unwrap();
+
+        assert_eq!(prepared, cwd);
+        assert!(prepared.is_dir());
+
+        let page = state.logs().page(Some(LogLevel::Info), 0, 10, None);
+        assert!(page
+            .entries
+            .iter()
+            .any(|entry| entry.summary == "自动创建 workdir"));
+    }
+
+    #[tokio::test]
+    async fn prepare_workdir_rejects_file_path() {
+        let state = AppState::new();
+        let root = tempfile::tempdir().unwrap();
+        let file_path = root.path().join("not-a-directory");
+        fs::write(&file_path, "content").await.unwrap();
+
+        let error = prepare_workdir(&state, Some(file_path.display().to_string()), "code")
+            .await
+            .unwrap_err();
+
+        assert!(error.contains("workdir 不是目录"));
+        assert!(state.logs().page(Some(LogLevel::Error), 0, 10, None).total > 0);
+    }
 }

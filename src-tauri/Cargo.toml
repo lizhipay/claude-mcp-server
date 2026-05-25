@@ -1,6 +1,6 @@
 [package]
 name = "cclaude-mcp"
-version = "0.1.5"
+version = "0.1.6"
 description = "Cute desktop Claude Code MCP server without Claude Code CLI"
 authors = ["Zoe"]
 edition = "2021"
