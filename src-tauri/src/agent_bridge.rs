@@ -1,6 +1,7 @@
 use std::{
-    env,
-    path::PathBuf,
+    env, fs,
+    path::{Path, PathBuf},
+    process::Command as StdCommand,
     sync::{
         atomic::{AtomicUsize, Ordering},
         Arc, Mutex,
@@ -206,6 +207,7 @@ impl AgentBridge {
 
         let script = locate_bridge_script()?;
         let node = node_executable();
+        let bridge_path = bridge_process_path(&node);
         *self
             .inner
             .bridge_script
@@ -217,7 +219,8 @@ impl AgentBridge {
             .lock()
             .expect("node executable poisoned") = node.clone();
 
-        let mut child = Command::new(&node)
+        let mut command = Command::new(&bridge_path);
+        command
             .arg(&script)
             .current_dir(
                 script
@@ -227,17 +230,19 @@ impl AgentBridge {
                         script.parent().unwrap_or_else(|| std::path::Path::new("."))
                     }),
             )
+            .env("PATH", augmented_path_for_node(&bridge_path))
             .stdin(std::process::Stdio::piped())
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::piped())
-            .kill_on_drop(true)
-            .spawn()
-            .map_err(|error| {
-                anyhow::anyhow!(
-                    "无法启动 Agent SDK bridge（需要可用的 Node.js 18+）：{}",
-                    error
-                )
-            })?;
+            .kill_on_drop(true);
+
+        let mut child = command.spawn().map_err(|error| {
+            anyhow::anyhow!(
+                "无法启动 Agent SDK bridge（需要可用的 Node.js 18+）：{}。已尝试 Node：{}",
+                error,
+                node
+            )
+        })?;
 
         let stdin = child
             .stdin
@@ -568,7 +573,154 @@ fn parse_level(level: Option<&str>) -> Option<LogLevel> {
 }
 
 fn node_executable() -> String {
-    env::var("CLAUDE_MCP_NODE").unwrap_or_else(|_| "node".to_string())
+    resolve_node_executable().unwrap_or_else(|| "node".to_string())
+}
+
+fn resolve_node_executable() -> Option<String> {
+    let mut candidates = Vec::new();
+    if let Ok(explicit) = env::var("CLAUDE_MCP_NODE") {
+        let explicit = explicit.trim();
+        if !explicit.is_empty() {
+            candidates.push(PathBuf::from(explicit));
+        }
+    }
+    if let Ok(path) = env::var("PATH") {
+        candidates.extend(find_in_path("node", &path));
+    }
+
+    candidates.extend(common_node_candidates());
+
+    candidates
+        .into_iter()
+        .filter(|path| node_candidate_is_usable(path))
+        .map(|path| path.display().to_string())
+        .next()
+}
+
+fn bridge_process_path(node: &str) -> PathBuf {
+    PathBuf::from(node)
+}
+
+fn augmented_path_for_node(node: &Path) -> String {
+    let mut paths = Vec::new();
+    if let Some(parent) = node.parent() {
+        paths.push(parent.to_path_buf());
+    }
+    if let Ok(existing) = env::var("PATH") {
+        paths.extend(env::split_paths(&existing));
+    }
+    env::join_paths(paths)
+        .map(|path| path.to_string_lossy().to_string())
+        .unwrap_or_else(|_| env::var("PATH").unwrap_or_default())
+}
+
+fn common_node_candidates() -> Vec<PathBuf> {
+    let mut candidates = vec![
+        PathBuf::from("/opt/homebrew/bin/node"),
+        PathBuf::from("/usr/local/bin/node"),
+        PathBuf::from("/opt/local/bin/node"),
+        PathBuf::from("/usr/bin/node"),
+        PathBuf::from("/bin/node"),
+        PathBuf::from("/snap/bin/node"),
+    ];
+
+    if let Some(home) = home_dir() {
+        candidates.push(home.join(".volta/bin/node"));
+        candidates.push(home.join(".asdf/shims/node"));
+        candidates.push(home.join(".local/share/mise/shims/node"));
+        candidates.extend(versioned_node_bins(
+            home.join(".nvm/versions/node"),
+            "bin/node",
+        ));
+        candidates.extend(versioned_node_bins(
+            home.join(".fnm/node-versions"),
+            "installation/bin/node",
+        ));
+    }
+
+    #[cfg(windows)]
+    {
+        if let Ok(program_files) = env::var("ProgramFiles") {
+            candidates.push(PathBuf::from(program_files).join("nodejs/node.exe"));
+        }
+        if let Ok(program_files_x86) = env::var("ProgramFiles(x86)") {
+            candidates.push(PathBuf::from(program_files_x86).join("nodejs/node.exe"));
+        }
+        if let Ok(local_app_data) = env::var("LOCALAPPDATA") {
+            candidates.push(PathBuf::from(local_app_data).join("Programs/nodejs/node.exe"));
+        }
+        if let Ok(app_data) = env::var("APPDATA") {
+            candidates.extend(versioned_node_bins(
+                PathBuf::from(app_data).join("nvm"),
+                "node.exe",
+            ));
+        }
+    }
+
+    candidates
+}
+
+fn find_in_path(executable: &str, path: &str) -> Vec<PathBuf> {
+    let names = executable_names(executable);
+    env::split_paths(path)
+        .flat_map(|dir| names.iter().map(move |name| dir.join(name)))
+        .collect()
+}
+
+#[cfg(not(windows))]
+fn executable_names(executable: &str) -> Vec<String> {
+    vec![executable.to_string()]
+}
+
+#[cfg(windows)]
+fn executable_names(executable: &str) -> Vec<String> {
+    vec![
+        executable.to_string(),
+        format!("{executable}.exe"),
+        format!("{executable}.cmd"),
+    ]
+}
+
+fn versioned_node_bins(root: PathBuf, suffix: &str) -> Vec<PathBuf> {
+    let Ok(entries) = fs::read_dir(root) else {
+        return Vec::new();
+    };
+    let mut paths: Vec<PathBuf> = entries
+        .filter_map(Result::ok)
+        .map(|entry| entry.path().join(suffix))
+        .collect();
+    paths.sort_by(|a, b| b.cmp(a));
+    paths
+}
+
+fn home_dir() -> Option<PathBuf> {
+    env::var_os("HOME")
+        .map(PathBuf::from)
+        .or_else(|| env::var_os("USERPROFILE").map(PathBuf::from))
+}
+
+fn node_candidate_is_usable(path: &Path) -> bool {
+    if path.components().count() > 1 && !path.exists() {
+        return false;
+    }
+    let Ok(output) = StdCommand::new(path).arg("--version").output() else {
+        return false;
+    };
+    if !output.status.success() {
+        return false;
+    }
+    let version = String::from_utf8_lossy(&output.stdout);
+    parse_node_major_version(&version).is_some_and(|major| major >= 18)
+}
+
+fn parse_node_major_version(version: &str) -> Option<u64> {
+    version
+        .trim()
+        .trim_start_matches('v')
+        .split('.')
+        .next()?
+        .parse()
+        .ok()
 }
 
 fn locate_bridge_script() -> anyhow::Result<PathBuf> {
@@ -591,4 +743,30 @@ fn locate_bridge_script() -> anyhow::Result<PathBuf> {
         .into_iter()
         .find(|path| path.exists())
         .ok_or_else(|| anyhow::anyhow!("找不到 Agent SDK bridge 脚本"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parses_supported_node_major_versions() {
+        assert_eq!(parse_node_major_version("v22.13.1"), Some(22));
+        assert_eq!(parse_node_major_version("18.19.0"), Some(18));
+        assert_eq!(parse_node_major_version("node"), None);
+    }
+
+    #[test]
+    fn finds_node_inside_path_entries() {
+        let paths = find_in_path("node", "/a/bin:/b/bin");
+        assert!(paths.contains(&PathBuf::from("/a/bin/node")));
+        assert!(paths.contains(&PathBuf::from("/b/bin/node")));
+    }
+
+    #[test]
+    fn includes_common_nvm_candidate_for_home() {
+        let candidates =
+            versioned_node_bins(PathBuf::from("/definitely/not/a/real/nvm/root"), "bin/node");
+        assert!(candidates.is_empty());
+    }
 }
