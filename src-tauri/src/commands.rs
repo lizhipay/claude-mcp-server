@@ -1,7 +1,8 @@
 use tauri::{AppHandle, State};
 
 use crate::{
-    claude, config,
+    agent_bridge::AgentRuntimeStatus,
+    agent_runtime, claude, config,
     config::{AppConfig, SaveConfigPayload},
     logs::{LogEntry, LogLevel, LogPage, LogStats},
     server::ServerStatus,
@@ -80,6 +81,13 @@ pub async fn get_server_status(state: State<'_, AppState>) -> Result<ServerStatu
 #[tauri::command]
 pub async fn get_runtime_stats(state: State<'_, AppState>) -> Result<RuntimeStatsSnapshot, String> {
     Ok(state.runtime_stats())
+}
+
+#[tauri::command]
+pub async fn get_agent_runtime_status(
+    state: State<'_, AppState>,
+) -> Result<AgentRuntimeStatus, String> {
+    Ok(agent_runtime::status(&state))
 }
 
 #[tauri::command]

@@ -1,6 +1,6 @@
 {
   "name": "cclaude-mcp",
-  "version": "0.1.6",
+  "version": "0.1.7",
   "private": true,
   "type": "module",
   "scripts": {
@@ -11,6 +11,7 @@
     "tauri": "tauri"
   },
   "dependencies": {
+    "@anthropic-ai/claude-agent-sdk": "^0.3.150",
     "@tauri-apps/api": "^2.11.0",
     "lucide-react": "^1.16.0",
     "react": "^19.2.1",

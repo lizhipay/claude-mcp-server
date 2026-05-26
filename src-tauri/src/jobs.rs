@@ -17,7 +17,7 @@ use tokio::sync::Notify;
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
-use crate::{claude, logs::LogLevel, state::AppState};
+use crate::{agent_runtime, logs::LogLevel, state::AppState};
 
 const SYNC_WAIT_SECONDS: u64 = 90;
 const DEFAULT_RECENT_CHARS: usize = 8_000;
@@ -141,7 +141,7 @@ impl JobStore {
                 job.started_at = Some(Utc::now().timestamp_millis());
             }
             spawned_state.notify_runtime_stats_changed();
-            let result = claude::run_agent(
+            let result = agent_runtime::run_agent(
                 spawned_state.clone(),
                 prompt,
                 cwd,

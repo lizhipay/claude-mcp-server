@@ -3,12 +3,14 @@ import { listen as tauriListen } from "@tauri-apps/api/event";
 
 export type ServiceStatus = "stopped" | "starting" | "running" | "error";
 export type LogLevel = "debug" | "info" | "warn" | "error";
+export type AgentRuntime = "sdk" | "legacy";
 
 export interface AppConfig {
   api_url: string;
   model: string;
   port: number;
   has_api_key: boolean;
+  agent_runtime: AgentRuntime;
 }
 
 export interface SaveConfigPayload {
@@ -16,6 +18,7 @@ export interface SaveConfigPayload {
   api_key?: string;
   model: string;
   port: number;
+  agent_runtime?: AgentRuntime;
 }
 
 export interface ServerStatus {
@@ -106,6 +109,17 @@ export interface RuntimeStatsSnapshot {
   token_updated_at?: string | null;
 }
 
+export interface AgentRuntimeStatus {
+  runtime: AgentRuntime;
+  bridge_started: boolean;
+  sdk_version?: string | null;
+  native_binary_path?: string | null;
+  bridge_script?: string | null;
+  node_executable: string;
+  active_sessions: number;
+  last_error?: string | null;
+}
+
 type Unlisten = () => void;
 
 const mockConfig: AppConfig = {
@@ -113,6 +127,7 @@ const mockConfig: AppConfig = {
   model: "claude-opus-4-7",
   port: 8765,
   has_api_key: false,
+  agent_runtime: "sdk",
 };
 
 const mockStatus: ServerStatus = {
@@ -169,6 +184,17 @@ const emptyRuntimeStats: RuntimeStatsSnapshot = {
   token_updated_at: null,
 };
 
+const emptyAgentRuntimeStatus: AgentRuntimeStatus = {
+  runtime: "sdk",
+  bridge_started: false,
+  sdk_version: null,
+  native_binary_path: null,
+  bridge_script: null,
+  node_executable: "node",
+  active_sessions: 0,
+  last_error: null,
+};
+
 function toPageNumber(value: number): number {
   return Math.max(0, Math.floor(Number.isFinite(value) ? value : 0));
 }
@@ -192,6 +218,7 @@ export const api = {
       model: payload.model,
       port: payload.port,
       has_api_key: Boolean(payload.api_key),
+      agent_runtime: payload.agent_runtime ?? "sdk",
     })),
   testApiConnection: () => invoke<string>("test_api_connection", undefined, () => "Tauri 里才能测试连接哦"),
   startServer: () => invoke<ServerStatus>("start_mcp_server", undefined, () => mockStatus),
@@ -199,6 +226,12 @@ export const api = {
   getStatus: () => invoke<ServerStatus>("get_server_status", undefined, () => mockStatus),
   getRuntimeStats: () =>
     invoke<RuntimeStatsSnapshot>("get_runtime_stats", undefined, () => emptyRuntimeStats),
+  getAgentRuntimeStatus: () =>
+    invoke<AgentRuntimeStatus>(
+      "get_agent_runtime_status",
+      undefined,
+      () => emptyAgentRuntimeStatus,
+    ),
   getLogStats: (query = "") =>
     invoke<LogStats>("get_log_stats", { query }, () => emptyLogStats),
   getLogPage: (level: LogLevel | null, offset: number, limit: number, query = "") =>

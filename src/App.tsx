@@ -60,6 +60,7 @@ const defaultConfig: AppConfig = {
   model: "claude-opus-4-7",
   port: 8765,
   has_api_key: false,
+  agent_runtime: "sdk",
 };
 
 const defaultStatus: ServerStatus = {

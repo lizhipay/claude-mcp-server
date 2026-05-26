@@ -199,6 +199,7 @@ mod tests {
             model: "claude-test".to_string(),
             port,
             has_api_key: false,
+            agent_runtime: crate::config::AgentRuntime::Sdk,
         };
         let status = state.server().start(state.clone(), cfg).await.unwrap();
         assert_eq!(status.status, ServiceStatus::Running);

@@ -11,7 +11,8 @@ use serde::Serialize;
 use tauri::{AppHandle, Emitter};
 
 use crate::{
-    jobs::JobStore, logs::LogStore, server::ServerController, token_usage::TokenUsageStore,
+    agent_bridge::AgentBridge, jobs::JobStore, logs::LogStore, server::ServerController,
+    token_usage::TokenUsageStore,
 };
 
 const RUNTIME_STATS_EVENT: &str = "runtime-stats-updated";
@@ -29,6 +30,7 @@ pub struct AppStateInner {
     pub jobs: JobStore,
     pub server: ServerController,
     pub token_usage: TokenUsageStore,
+    pub agent_bridge: AgentBridge,
     pub http: Client,
     pub runtime: RuntimeState,
 }
@@ -77,6 +79,7 @@ impl AppState {
                 jobs: JobStore::default(),
                 server: ServerController::default(),
                 token_usage: TokenUsageStore::default(),
+                agent_bridge: AgentBridge::default(),
                 http,
                 runtime: RuntimeState::default(),
             }),
@@ -97,6 +100,10 @@ impl AppState {
 
     pub fn token_usage(&self) -> &TokenUsageStore {
         &self.inner.token_usage
+    }
+
+    pub fn agent_bridge(&self) -> &AgentBridge {
+        &self.inner.agent_bridge
     }
 
     pub fn http(&self) -> &Client {

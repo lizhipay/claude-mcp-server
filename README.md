@@ -1,6 +1,6 @@
 # Claude MCP
 
-Claude MCP 是一个跨平台桌面软件，用 Tauri 2、Rust、React 和 TypeScript 构建。它在本机启动一个 MCP Streamable HTTP 服务，让 Codex 等 MCP 客户端可以在不安装 Claude Code CLI 的情况下，把任务交给 Claude 兼容的 `/v1/messages` API 执行。
+Claude MCP 是一个跨平台桌面软件，用 Tauri 2、Rust、React 和 TypeScript 构建。它在本机启动一个 MCP Streamable HTTP 服务，让 Codex 等 MCP 客户端可以在不安装 Claude Code CLI 的情况下，把任务交给 Claude Agent SDK 执行。
 
 默认 MCP 地址是：
 
@@ -11,8 +11,7 @@ http://127.0.0.1:8765/mcp
 ## 适合做什么
 
 - 让 Codex 调用一个本地 Claude Agent。
-- 让 Claude 读写指定工作目录里的文件。
-- 让 Claude 在指定工作目录执行命令。
+- 使用 Claude Code 同源的 Agent 能力读写文件、搜索项目、修改代码和执行命令。
 - 查看每次 MCP 请求、上游 API 调用、本地工具执行和错误日志。
 - 统计每天的 input、output、cache read、cache write 和 total token。
 
@@ -60,6 +59,24 @@ http://127.0.0.1:8765/mcp
 
 ```text
 http://127.0.0.1:8765/health
+```
+
+## Agent 内核
+
+默认内核是官方 `@anthropic-ai/claude-agent-sdk`。它使用 Claude Code 同源的 agent loop、工具、上下文管理、session、hooks 和权限系统；安装包会携带 Agent SDK native binary，不需要用户单独安装 Claude Code CLI。
+
+Claude MCP 仍保留 `legacy` 内核作为兜底。如果 Agent SDK bridge 在当前机器上无法启动，任务会自动切回 legacy，并在运行日志里写清楚原因。普通用户不需要手动切换。
+
+开发环境需要先执行：
+
+```bash
+npm install
+```
+
+然后使用：
+
+```bash
+npm run dev
 ```
 
 ## 在 Codex 里添加 MCP
@@ -347,9 +364,19 @@ workdir: /Users/zoe/Developer/ai/cclaude-mcp
 
 ## Claude Agent 能使用的本地能力
 
-Claude MCP 的后端会把 Claude 的工具请求转成本机操作：
+默认 SDK 内核使用 Claude Code 的内置工具：
 
-| 本地工具 | 能力 |
+| 能力 | 说明 |
+| --- | --- |
+| 文件读取 | 读取 `workdir` 内相关文件 |
+| 文件编辑 | 使用 Claude Code 的编辑能力修改文件 |
+| 项目搜索 | 使用 Glob/Grep 等工具查找代码 |
+| 命令执行 | 在 `workdir` 下执行开发命令 |
+| Todo / session | 复用 Claude Code 的任务规划和上下文管理 |
+
+legacy 内核仍保留旧工具：
+
+| legacy 工具 | 能力 |
 | --- | --- |
 | `read_file` | 读取 UTF-8 文件 |
 | `write_file` | 写入 UTF-8 文件，必要时创建父目录 |
@@ -364,7 +391,7 @@ Claude MCP 的后端会把 Claude 的工具请求转成本机操作：
 - 命令输出会截断，避免日志和返回结果过大。
 - 服务只绑定 `127.0.0.1`，不会监听公网地址。
 
-注意：只把可信目录作为 `workdir`。Claude 可以在该目录下读写文件并执行命令。
+注意：只把可信目录作为 `workdir`。SDK 内核使用 `bypassPermissions` 完全放行模式，Claude 可以直接读写文件、执行命令和调用内置工具；Claude MCP 不再额外拦截危险命令或敏感路径。
 
 ## 日志
 

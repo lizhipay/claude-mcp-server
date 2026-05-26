@@ -17,6 +17,7 @@ pub struct AppConfig {
     pub model: String,
     pub port: u16,
     pub has_api_key: bool,
+    pub agent_runtime: AgentRuntime,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -25,6 +26,21 @@ pub struct SaveConfigPayload {
     pub api_key: Option<String>,
     pub model: String,
     pub port: u16,
+    #[serde(default)]
+    pub agent_runtime: Option<AgentRuntime>,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum AgentRuntime {
+    Sdk,
+    Legacy,
+}
+
+impl Default for AgentRuntime {
+    fn default() -> Self {
+        Self::Sdk
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -32,6 +48,8 @@ struct ConfigFile {
     api_url: String,
     model: String,
     port: u16,
+    #[serde(default)]
+    agent_runtime: AgentRuntime,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     api_key: Option<String>,
 }
@@ -42,6 +60,7 @@ impl Default for ConfigFile {
             api_url: DEFAULT_API_URL.to_string(),
             model: DEFAULT_MODEL.to_string(),
             port: DEFAULT_PORT,
+            agent_runtime: AgentRuntime::Sdk,
             api_key: None,
         }
     }
@@ -63,6 +82,7 @@ impl ConfigFile {
             model: self.model,
             port: self.port,
             has_api_key,
+            agent_runtime: self.agent_runtime,
         }
     }
 }
@@ -75,6 +95,10 @@ pub fn config_path() -> anyhow::Result<PathBuf> {
 
 pub fn load_config() -> AppConfig {
     load_config_file().into_app_config()
+}
+
+pub fn load_agent_runtime() -> AgentRuntime {
+    load_config_file().agent_runtime
 }
 
 pub fn require_api_key() -> anyhow::Result<String> {
@@ -137,6 +161,7 @@ fn save_config_to_path(payload: SaveConfigPayload, path: &Path) -> anyhow::Resul
         api_url: api_url.to_string(),
         model: model.to_string(),
         port: payload.port,
+        agent_runtime: payload.agent_runtime.unwrap_or(previous.agent_runtime),
         api_key,
     };
     if let Some(parent) = path.parent() {
@@ -188,6 +213,14 @@ pub fn normalize_messages_url(input: &str) -> anyhow::Result<String> {
     Ok(url)
 }
 
+pub fn normalize_api_base_url(input: &str) -> anyhow::Result<String> {
+    let messages_url = normalize_messages_url(input)?;
+    Ok(messages_url
+        .trim_end_matches("/v1/messages")
+        .trim_end_matches('/')
+        .to_string())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -209,8 +242,21 @@ mod tests {
     }
 
     #[test]
+    fn normalizes_api_base_url() {
+        assert_eq!(
+            normalize_api_base_url("https://example.com/v1/messages").unwrap(),
+            "https://example.com"
+        );
+        assert_eq!(
+            normalize_api_base_url("https://example.com").unwrap(),
+            "https://example.com"
+        );
+    }
+
+    #[test]
     fn default_model_is_opus() {
         assert_eq!(ConfigFile::default().model, "claude-opus-4-7");
+        assert_eq!(ConfigFile::default().agent_runtime, AgentRuntime::Sdk);
     }
 
     #[test]
@@ -224,6 +270,7 @@ mod tests {
                     api_url: "https://example.com".to_string(),
                     model: legacy_model.to_string(),
                     port: 8765,
+                    agent_runtime: AgentRuntime::Sdk,
                     api_key: None,
                 },
             )
@@ -249,6 +296,7 @@ mod tests {
                 api_key: Some("sk-local-secret".to_string()),
                 model: "claude-opus-4-7".to_string(),
                 port: 8765,
+                agent_runtime: None,
             },
             &path,
         )
@@ -274,6 +322,7 @@ mod tests {
                 api_key: Some("sk-existing".to_string()),
                 model: "claude-opus-4-7".to_string(),
                 port: 8765,
+                agent_runtime: Some(AgentRuntime::Legacy),
             },
             &path,
         )
@@ -284,15 +333,18 @@ mod tests {
                 api_key: Some("  ".to_string()),
                 model: "claude-opus-4-7".to_string(),
                 port: 8766,
+                agent_runtime: None,
             },
             &path,
         )
         .unwrap();
 
         assert!(saved.has_api_key);
+        assert_eq!(saved.agent_runtime, AgentRuntime::Legacy);
         let file = load_config_file_from(&path);
         assert_eq!(file.api_key.as_deref(), Some("sk-existing"));
         assert_eq!(file.port, 8766);
+        assert_eq!(file.agent_runtime, AgentRuntime::Legacy);
     }
 
     #[test]
@@ -314,6 +366,7 @@ mod tests {
                 api_url: "https://example.com".to_string(),
                 model: "claude-opus-4-7".to_string(),
                 port: 8765,
+                agent_runtime: AgentRuntime::Sdk,
                 api_key: Some("sk-permission".to_string()),
             },
         )

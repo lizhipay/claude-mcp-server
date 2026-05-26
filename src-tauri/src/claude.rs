@@ -1,4 +1,4 @@
-use std::{path::PathBuf, time::Duration};
+use std::{io::ErrorKind, path::PathBuf, time::Duration};
 
 use futures_util::StreamExt;
 use serde_json::{json, Value};
@@ -375,6 +375,15 @@ fn record_token_usage(
     }
 }
 
+pub(crate) fn record_external_token_usage(
+    state: &AppState,
+    usage: &Value,
+    request_id: Option<String>,
+    task_id: Option<String>,
+) {
+    record_token_usage(state, usage, request_id, task_id);
+}
+
 fn log_cache_usage_hint(
     state: &AppState,
     runtime: &RuntimeConfig,
@@ -644,7 +653,7 @@ async fn execute_local_tool(
         "write_file" => write_file(cwd, &tool_use.input).await,
         "list_dir" => list_dir(cwd, &tool_use.input).await,
         "run_command" => run_command(cwd, &tool_use.input, cancel).await,
-        other => anyhow::bail!("未知工具：{other}"),
+        other => Err(anyhow::anyhow!("未知工具：{other}")),
     };
 
     match &result {
@@ -661,7 +670,7 @@ async fn execute_local_tool(
             })),
         ),
         Err(error) => state.logs().push(
-            LogLevel::Error,
+            local_tool_failure_level(&tool_use.name),
             "tool",
             None,
             Some(task_id.to_string()),
@@ -695,14 +704,13 @@ async fn write_file(cwd: &PathBuf, input: &Value) -> anyhow::Result<String> {
 }
 
 async fn list_dir(cwd: &PathBuf, input: &Value) -> anyhow::Result<String> {
-    let path = resolve_path(
-        cwd,
-        input
-            .get("path")
-            .and_then(Value::as_str)
-            .filter(|s| !s.is_empty())
-            .unwrap_or("."),
-    );
+    let raw_path = input
+        .get("path")
+        .and_then(Value::as_str)
+        .filter(|s| !s.is_empty())
+        .unwrap_or(".");
+    let path = resolve_path(cwd, raw_path);
+    ensure_list_dir_path(cwd, &path).await?;
     let mut entries = fs::read_dir(&path).await?;
     let mut lines = Vec::new();
     while let Some(entry) = entries.next_entry().await? {
@@ -724,11 +732,10 @@ async fn run_command(
     cancel: &CancellationToken,
 ) -> anyhow::Result<String> {
     let command = required_string(input, "command")?;
-    let timeout_seconds = input
-        .get("timeout_seconds")
-        .and_then(Value::as_u64)
-        .unwrap_or(60)
-        .clamp(1, 600);
+    let timeout_seconds = effective_command_timeout_seconds(
+        command,
+        input.get("timeout_seconds").and_then(Value::as_u64),
+    );
 
     #[cfg(target_os = "windows")]
     let mut child = Command::new("cmd")
@@ -775,7 +782,7 @@ async fn run_command(
         result = tokio::time::timeout(Duration::from_secs(timeout_seconds), child.wait()) => {
             match result {
                 Ok(status) => status?,
-                Err(_) => anyhow::bail!("命令超过 {} 秒未完成", timeout_seconds),
+                Err(_) => anyhow::bail!("{}", command_timeout_message(command, timeout_seconds)),
             }
         }
     };
@@ -804,6 +811,85 @@ fn resolve_path(cwd: &PathBuf, path: &str) -> PathBuf {
     }
 }
 
+async fn ensure_list_dir_path(cwd: &PathBuf, path: &PathBuf) -> anyhow::Result<()> {
+    let metadata = match fs::metadata(path).await {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == ErrorKind::NotFound => {
+            anyhow::bail!(
+                "路径不存在：{}。请使用 workdir 相对路径，当前 workdir 是 {}",
+                path.display(),
+                cwd.display()
+            );
+        }
+        Err(error) => return Err(error.into()),
+    };
+
+    if !metadata.is_dir() {
+        anyhow::bail!("不是目录：{}。请传入目录路径", path.display());
+    }
+    Ok(())
+}
+
+fn local_tool_failure_level(tool_name: &str) -> LogLevel {
+    match tool_name {
+        "read_file" | "write_file" | "list_dir" | "run_command" => LogLevel::Warn,
+        _ => LogLevel::Error,
+    }
+}
+
+fn effective_command_timeout_seconds(command: &str, requested: Option<u64>) -> u64 {
+    let requested = requested.unwrap_or(60).clamp(1, 600);
+    if requested < 60 && should_use_long_command_timeout(command) {
+        60
+    } else {
+        requested
+    }
+}
+
+fn should_use_long_command_timeout(command: &str) -> bool {
+    let command = command.to_ascii_lowercase();
+    is_recursive_grep_command(&command)
+        || contains_shell_command(&command, "find")
+        || contains_shell_command(&command, "rg")
+        || contains_shell_command(&command, "npm")
+        || contains_shell_command(&command, "pnpm")
+        || contains_shell_command(&command, "yarn")
+        || contains_shell_command(&command, "bun")
+        || contains_shell_command(&command, "cargo")
+        || command.contains("go test")
+        || contains_shell_command(&command, "mvn")
+        || contains_shell_command(&command, "gradle")
+}
+
+fn is_recursive_grep_command(command: &str) -> bool {
+    command.contains("grep -r")
+        || command.contains("grep --recursive")
+        || command.contains("grep --directories=recurse")
+}
+
+fn contains_shell_command(command: &str, name: &str) -> bool {
+    let command = command.trim_start();
+    command == name
+        || command.starts_with(&format!("{name} "))
+        || command.contains(&format!(" {name} "))
+        || command.contains(&format!(";{name} "))
+        || command.contains(&format!("; {name} "))
+        || command.contains(&format!("&& {name} "))
+        || command.contains(&format!("|| {name} "))
+        || command.contains(&format!("| {name} "))
+}
+
+fn command_timeout_message(command: &str, timeout_seconds: u64) -> String {
+    if is_recursive_grep_command(&command.to_ascii_lowercase()) {
+        format!(
+            "搜索命令超时：命令超过 {} 秒未完成。请改用 rg，并排除 .git、node_modules、target、dist、build 等大目录",
+            timeout_seconds
+        )
+    } else {
+        format!("命令超过 {} 秒未完成", timeout_seconds)
+    }
+}
+
 fn required_string<'a>(input: &'a Value, key: &str) -> anyhow::Result<&'a str> {
     input
         .get(key)
@@ -822,7 +908,7 @@ pub fn truncate(input: &str, max_chars: usize) -> String {
 }
 
 fn system_prompt() -> &'static str {
-    "You are Claude Code running through a local MCP desktop server. You may read and write files and run commands through the provided tools. Execute the user's coding task directly, keep changes scoped to the requested workdir, run relevant verification commands when possible, and return a concise summary of what changed and what was verified."
+    "You are Claude Code running through a local MCP desktop server on the user's real local machine, not a Linux sandbox. Use the provided workdir as the default project root, but you have full local tool access and should follow the user's requested paths and commands. Prefer rg over grep/find for repository searches, and avoid scanning .git, node_modules, target, dist, build, release, cache, and other generated directories unless needed. Use bounded commands, give recursive searches/builds/tests enough timeout, run relevant verification commands when possible, and return a concise summary of what changed and what was verified."
 }
 
 fn cached_system_prompt() -> Vec<Value> {
@@ -1166,6 +1252,34 @@ mod tests {
         assert_eq!(minimum_cacheable_tokens("claude-sonnet-4-7"), 1024);
     }
 
+    #[test]
+    fn system_prompt_allows_full_local_access_and_search_rules() {
+        let prompt = system_prompt();
+
+        assert!(prompt.contains("real local machine"));
+        assert!(prompt.contains("workdir"));
+        assert!(prompt.contains("full local tool access"));
+        assert!(prompt.contains("Prefer rg"));
+        assert!(prompt.contains("node_modules"));
+    }
+
+    #[test]
+    fn command_timeout_is_raised_for_recursive_or_long_commands() {
+        assert_eq!(
+            effective_command_timeout_seconds("grep -rl \"needle\" .", Some(10)),
+            60
+        );
+        assert_eq!(
+            effective_command_timeout_seconds("rg \"needle\" .", Some(10)),
+            60
+        );
+        assert_eq!(
+            effective_command_timeout_seconds("cargo test", Some(30)),
+            60
+        );
+        assert_eq!(effective_command_timeout_seconds("pwd", Some(5)), 5);
+    }
+
     #[tokio::test]
     async fn tool_failure_log_includes_error_summary_and_detail() {
         let state = AppState::new();
@@ -1182,8 +1296,12 @@ mod tests {
                 .await
                 .unwrap_err();
 
-        let page = state.logs().page(Some(LogLevel::Error), 0, 10, None);
+        let page = state.logs().page(Some(LogLevel::Warn), 0, 10, None);
         assert_eq!(page.total, 1);
+        assert_eq!(
+            state.logs().page(Some(LogLevel::Error), 0, 10, None).total,
+            0
+        );
         let entry = &page.entries[0];
         assert!(entry.summary.starts_with("本地工具 list_dir 失败："));
         assert!(entry.summary.contains(&error.to_string()));
@@ -1194,6 +1312,46 @@ mod tests {
         assert_eq!(detail["workdir"], cwd.display().to_string());
         assert!(!detail["error"].as_str().unwrap().is_empty());
         assert!(detail["elapsed_ms"].is_u64());
+    }
+
+    #[tokio::test]
+    async fn list_dir_missing_absolute_path_returns_actionable_warning() {
+        let state = AppState::new();
+        let root = tempfile::tempdir().unwrap();
+        let cwd = root.path().to_path_buf();
+        let missing = cwd.join("missing-absolute");
+        let tool_use = ToolUse {
+            id: "tool-abs".to_string(),
+            name: "list_dir".to_string(),
+            input: json!({"path": missing.display().to_string()}),
+        };
+
+        let error = execute_local_tool(
+            &state,
+            &cwd,
+            "task-abs",
+            &tool_use,
+            &CancellationToken::new(),
+        )
+        .await
+        .unwrap_err();
+
+        assert!(error.to_string().contains("路径不存在"));
+        assert!(error.to_string().contains("workdir"));
+        assert_eq!(
+            state.logs().page(Some(LogLevel::Error), 0, 10, None).total,
+            0
+        );
+        let detail = state
+            .logs()
+            .detail(state.logs().page(Some(LogLevel::Warn), 0, 10, None).entries[0].id)
+            .unwrap()
+            .detail
+            .unwrap();
+        assert_eq!(detail["tool"], "list_dir");
+        assert_eq!(detail["workdir"], cwd.display().to_string());
+        assert_eq!(detail["input"]["path"], missing.display().to_string());
+        assert!(!detail["error"].as_str().unwrap().is_empty());
     }
 
     #[tokio::test]
@@ -1211,8 +1369,12 @@ mod tests {
             .await
             .unwrap_err();
 
-        let page = state.logs().page(Some(LogLevel::Error), 0, 10, None);
+        let page = state.logs().page(Some(LogLevel::Warn), 0, 10, None);
         assert_eq!(page.total, 1);
+        assert_eq!(
+            state.logs().page(Some(LogLevel::Error), 0, 10, None).total,
+            0
+        );
         let entry = &page.entries[0];
         assert!(entry.summary.contains("缺少参数：command"));
 
@@ -1220,6 +1382,33 @@ mod tests {
         assert_eq!(detail["tool"], "run_command");
         assert_eq!(detail["workdir"], cwd.display().to_string());
         assert_eq!(detail["input"], json!({}));
+    }
+
+    #[tokio::test]
+    async fn unknown_local_tool_still_logs_error() {
+        let state = AppState::new();
+        let root = tempfile::tempdir().unwrap();
+        let cwd = root.path().to_path_buf();
+        let tool_use = ToolUse {
+            id: "tool-unknown".to_string(),
+            name: "unknown_tool".to_string(),
+            input: json!({}),
+        };
+
+        execute_local_tool(
+            &state,
+            &cwd,
+            "task-unknown",
+            &tool_use,
+            &CancellationToken::new(),
+        )
+        .await
+        .unwrap_err();
+
+        assert_eq!(
+            state.logs().page(Some(LogLevel::Error), 0, 10, None).total,
+            1
+        );
     }
 
     #[tokio::test]

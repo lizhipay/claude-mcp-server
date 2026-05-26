@@ -1,3 +1,5 @@
+mod agent_bridge;
+mod agent_runtime;
 mod claude;
 mod commands;
 mod config;
@@ -38,6 +40,7 @@ pub fn run() {
             commands::stop_mcp_server,
             commands::get_server_status,
             commands::get_runtime_stats,
+            commands::get_agent_runtime_status,
             commands::get_log_stats,
             commands::get_log_page,
             commands::get_log_detail,
