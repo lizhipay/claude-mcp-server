@@ -233,134 +233,208 @@ cancelled
 
 `code_batch_poll` 一次最多接收 500 个 `job_id`，适合几百个并发任务分批读取。
 
-## 在 Codex 里怎么调用 Agent
+## 在 Codex 里怎么用
 
-最稳定的写法是直接点名 `claude-mcp`，明确工作目录，并要求 Codex 使用等待型工具。下面这些提示词可以直接复制到新 Codex 线程里测试。
+这个软件最适合的用法是：Codex 做调度和验收，Claude MCP 负责真正写代码、改文件、跑命令。你可以把它当成一个本机 Claude Code Agent，Codex 只需要把任务交给 `claude-mcp`。
 
-### 快速连通测试
+推荐流程：
+
+1. 打开 Claude MCP，保存 API 配置，点击“启动服务”。
+2. 在 Codex 里确认已经添加 `claude-mcp`。
+3. 新开一个 Codex 线程，把下面的提示词复制进去。
+4. Codex 调用 Claude MCP 写代码。
+5. Codex 读取结果、检查文件、跑必要验证。
+
+### 给 Codex 的固定开场白
+
+每次想让 Codex 调用这个软件时，可以先把这一段贴进去：
 
 ```text
-请只使用 claude-mcp，不要使用内置 shell。
+请优先使用 claude-mcp 来完成任务。
 
-调用 claude-mcp 的 code 工具。
+要求：
+1. 需要写代码、改文件、跑命令的部分，交给 claude-mcp 执行。
+2. 你负责监督进度、读取结果、检查产物和汇报结论。
+3. 明确传入 workdir，不要让 claude-mcp 在错误目录里工作。
+4. 长任务使用 code_start，然后用 code_wait 或 code_batch_poll 读取结果。
+5. 如果工具列表里暂时看不到 mcp__claude_mcp__，先提醒我检查 Claude MCP 是否启动，不要假装已经执行。
+```
+
+### 最小可用测试
+
+第一次连接时，用这个测试最简单：
+
+```text
+请使用 claude-mcp 的 code 工具执行一个连通测试。
 
 workdir: /tmp
 
 任务：
-用三句话解释 MCP Streamable HTTP 是什么。
+返回一句话：Claude MCP 已经可以被 Codex 调用了。
 ```
 
-### 推荐的长任务写法
+期望结果：Codex 会调用 `claude-mcp`，然后返回 Claude MCP 的回答。如果 Codex 说工具不存在，通常是 Claude MCP 没启动、Codex 没重新打开线程，或 MCP 名字没有添加成功。
+
+### 让 Claude MCP 修改一个项目
+
+适合修 bug、加功能、改 README、做小页面：
 
 ```text
-请只使用 claude-mcp，不要使用内置 shell。
+请使用 claude-mcp 完成下面的代码任务。
 
-调用 claude-mcp 的 code_start 启动任务，然后调用 code_wait 等待结果。
-
-workdir: /Users/zoe/Developer/ai/cclaude-mcp
-timeout_seconds: 120
+workdir: /Users/zoe/Developer/your-project
 
 任务：
-1. 阅读当前项目结构。
-2. 找出 MCP 工具实现的位置。
-3. 总结每个工具的用途、参数和适合的使用场景。
-4. 只返回总结，不要修改文件。
+1. 阅读项目结构。
+2. 找到用户登录页面。
+3. 修复登录失败时错误提示不明显的问题。
+4. 保持现有 UI 风格，不要重构无关代码。
+5. 修改完成后运行项目已有测试或最接近的检查命令。
+6. 最终返回：修改了哪些文件、验证命令、验证结果。
+
+执行方式：
+- 用 code_start 启动任务。
+- 用 code_wait 等待结果，timeout_seconds 设置为 300。
+- 不要只给计划，必须让 claude-mcp 实际改文件。
 ```
 
-### 带上下文文件
+### 让 Claude MCP 写一个完整页面
+
+适合把一个需求直接交给 Claude MCP 做完：
 
 ```text
-请只使用 claude-mcp，不要使用内置 shell。
+请使用 claude-mcp 写一个完整页面。
 
-调用 claude-mcp 的 code_with_context 工具。
-
-workdir: /Users/zoe/Developer/ai/cclaude-mcp
-files: ["README.md", "package.json"]
+workdir: /Users/zoe/Developer/your-project
 
 任务：
-根据这两个文件，总结这个项目的启动方式、构建方式和发布方式。
+做一个订单列表页面，要求：
+1. 能展示订单号、客户、金额、状态、创建时间。
+2. 支持按状态筛选。
+3. 支持搜索订单号和客户名。
+4. 保持项目现有组件和样式习惯。
+5. 如果需要新增文件，可以新增。
+6. 完成后运行类型检查或构建命令。
+7. 最终返回可访问路径、修改文件、验证结果。
+
+执行方式：
+- 使用 code_start。
+- 如果超过 5 分钟还没完成，用 code_status 看最近输出。
+- 完成后用 code_result 读取最终结果。
 ```
 
-### 代码审查
+### 让 Claude MCP 做代码审查
+
+适合让 Claude MCP 只读检查，不改文件：
 
 ```text
-请只使用 claude-mcp，不要使用内置 shell。
+请使用 claude-mcp 做一次代码审查。
 
-调用 claude-mcp 的 code_start 启动任务，然后调用 code_wait 等待结果。
-
-workdir: /Users/zoe/Developer/ai/cclaude-mcp
-timeout_seconds: 180
+workdir: /Users/zoe/Developer/your-project
 
 任务：
-请做一次代码审查，只列出真实风险：
-1. 优先找会导致运行失败、数据错误、并发问题或测试缺口的点。
-2. 每个问题都要给出文件路径和原因。
-3. 如果没有发现问题，明确说没有发现阻塞级问题。
-4. 不要修改文件。
+1. 只读检查，不要修改文件。
+2. 优先找会导致运行失败、数据错误、并发问题、安全问题或测试缺口的点。
+3. 每个问题都要写清楚文件路径、原因和建议修复方式。
+4. 如果没有发现明显问题，明确说没有发现阻塞级问题。
+
+执行方式：
+- 使用 code_start。
+- 使用 code_wait 等待结果。
 ```
 
-### 读写文件和命令执行测试
+### 让 Claude MCP 自己启动服务
+
+适合做小游戏、静态页面、Demo 项目：
 
 ```text
-请只使用 claude-mcp，不要使用内置 shell。
+请使用 claude-mcp 在下面目录里完成一个可运行 Demo。
 
-调用 claude-mcp 的 code_start 启动任务，然后调用 code_wait 等待结果。
-
-workdir: /tmp/claude-mcp-smoke-test
-timeout_seconds: 120
+workdir: /Users/zoe/Developer/ai/test
 
 任务：
-1. 创建一个最小 Node.js 项目。
-2. 写一个 add(a, b) 函数。
-3. 写一个测试文件验证 add(2, 3) 等于 5。
-4. 运行测试。
-5. 返回创建的文件列表、测试命令和测试结果。
+1. 做一个完整可玩的贪吃蛇游戏。
+2. 二次元可爱风格。
+3. 支持键盘方向键、WASD 和移动端触控。
+4. 包含开始、暂停、重新开始、得分、最高分。
+5. 写完后自己启动本地服务。
+6. 服务只监听 127.0.0.1，端口任选可用端口。
+7. 启动后用 curl 验证首页能访问。
+8. 最终返回浏览器可以直接打开的 URL。
+
+执行方式：
+- 使用 code_start。
+- 用 code_wait 等待结果。
+- 如果服务被前台进程挂住，读取到 URL 后再让 claude-mcp 单独关闭服务。
 ```
 
-### 并发批量任务
+### 多个任务并发处理
+
+适合让 Claude MCP 同时做多件互不影响的事。Codex 负责启动任务和收结果：
 
 ```text
-请只使用 claude-mcp，不要使用内置 shell。
+请使用 claude-mcp 并发完成下面 3 个只读任务。
 
-请用 claude-mcp 的 code_start 连续启动 5 个任务，每个任务都使用 workdir=/tmp。
+workdir: /Users/zoe/Developer/your-project
 
-任务 1：等待 10 秒后返回 JSON {"task":1,"ok":true}
-任务 2：等待 10 秒后返回 JSON {"task":2,"ok":true}
-任务 3：等待 10 秒后返回 JSON {"task":3,"ok":true}
-任务 4：等待 10 秒后返回 JSON {"task":4,"ok":true}
-任务 5：等待 10 秒后返回 JSON {"task":5,"ok":true}
+任务 A：
+阅读 README.md，判断新用户能不能顺利启动项目。
 
-维护 seen_job_ids = []。
-全部启动后，每 3 秒调用一次 code_batch_poll：
-{
-  "job_ids": ["上面 5 个 job_id"],
-  "seen_job_ids": seen_job_ids,
-  "timeout_seconds": 3,
-  "recent_chars": 4000
-}
-每次处理 completed / failed / cancelled / not_found。
-把返回的 next_seen_job_ids 保存为新的 seen_job_ids。
-当 complete=true 时停止读取并输出最终汇总。
+任务 B：
+阅读 package.json 和 src 目录，整理项目的构建、测试和开发命令。
+
+任务 C：
+阅读最近改动，找出可能缺少测试的地方。
+
+执行方式：
+1. 用 code_start 分别启动 3 个任务。
+2. 保存返回的 job_id。
+3. 维护 seen_job_ids = []。
+4. 每 3 秒调用一次 code_batch_poll：
+   {
+     "job_ids": ["任务 A 的 job_id", "任务 B 的 job_id", "任务 C 的 job_id"],
+     "seen_job_ids": seen_job_ids,
+     "timeout_seconds": 3,
+     "recent_chars": 4000
+   }
+5. 每次处理 completed / failed / cancelled / not_found。
+6. 把返回的 next_seen_job_ids 保存为新的 seen_job_ids。
+7. complete=true 后停止读取，合并结果给我。
 ```
 
-### 大任务分工
+### 让 Codex 监督 Claude MCP 写完再验收
+
+这是最推荐的真实工作提示词：
 
 ```text
-请只使用 claude-mcp，不要使用内置 shell。
+请把自己当成监督者，把写代码的工作交给 claude-mcp。
 
-目标项目：
-workdir: /Users/zoe/Developer/ai/cclaude-mcp
+目标目录：
+workdir: /Users/zoe/Developer/your-project
 
-请把下面工作拆成 3 个 claude-mcp 任务并发执行，每个任务用 code_start 启动：
-1. 阅读 README.md，找出使用教程是否清楚。
-2. 阅读 src-tauri/src/mcp.rs，整理 MCP 工具列表和参数。
-3. 阅读 src-tauri/src/jobs.rs，说明异步任务和等待机制。
+需求：
+修复用户反馈的这个问题：保存按钮点击后没有任何提示。
 
-三个任务都不要修改文件。
-全部启动后，用 code_batch_poll 每 3 秒增量读取一次。
-每次处理新完成的任务，并把 next_seen_job_ids 保存为下一次的 seen_job_ids。
-当 complete=true 时停止读取，合并三个结果，输出一份简洁总结。
+执行要求：
+1. 你不要直接改代码。
+2. 调用 claude-mcp 的 code_start，让它检查项目、修改代码、运行验证。
+3. 用 code_wait 或 code_batch_poll 读取结果。
+4. Claude MCP 完成后，你再检查 git diff，确认改动范围合理。
+5. 如果验证失败，把失败原因继续交给 claude-mcp 修。
+6. 最后只汇报：改了什么、验证是否通过、还有没有风险。
 ```
+
+### 常见情况怎么处理
+
+| 情况 | 推荐做法 |
+| --- | --- |
+| 任务很短 | 用 `code` |
+| 任务可能超过 1 分钟 | 用 `code_start` + `code_wait` |
+| 同时启动很多任务 | 用多个 `code_start` + `code_batch_poll` |
+| 只想读结果，不等待 | 用 `code_result` 或 `code_batch_result` |
+| 任务卡住 | 先用 `code_status` 看最近输出，再决定是否 `code_cancel` |
+| Codex 说工具不存在 | 确认 Claude MCP 已启动，并重新打开 Codex 线程 |
+| Claude 在错误目录工作 | 提示词里写清楚绝对路径 `workdir` |
 
 ## Claude Agent 能使用的本地能力
 
