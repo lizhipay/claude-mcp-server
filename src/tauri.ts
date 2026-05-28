@@ -102,6 +102,8 @@ export interface RuntimeStatsSnapshot {
   failed_jobs: number;
   cancelled_jobs: number;
   active_upstream_requests: number;
+  agent_bridge_active_jobs: number;
+  agent_bridge_waiting_first_response: number;
   logs_retained: number;
   logs_dropped: number;
   logs_pending: number;
@@ -117,7 +119,68 @@ export interface AgentRuntimeStatus {
   bridge_script?: string | null;
   node_executable: string;
   active_sessions: number;
+  active_jobs: number;
+  waiting_first_response: number;
   last_error?: string | null;
+}
+
+export type JobStatus = "queued" | "running" | "succeeded" | "failed" | "cancelled";
+
+export interface JobSummary {
+  job_id: string;
+  root_job_id: string;
+  parent_job_id?: string | null;
+  session_id?: string | null;
+  resumable: boolean;
+  expires_at?: number | null;
+  status: JobStatus;
+  complete: boolean;
+  cwd: string;
+  prompt_preview: string;
+  created_at: number;
+  started_at?: number | null;
+  ended_at?: number | null;
+  output_recent: string;
+  output_truncated: boolean;
+  error?: string | null;
+}
+
+export interface ChatJobRecord {
+  job_id: string;
+  parent_job_id?: string | null;
+  prompt: string;
+  status: JobStatus | string;
+  created_at: number;
+  started_at?: number | null;
+  ended_at?: number | null;
+  output?: string | null;
+  error?: string | null;
+}
+
+export interface ChatSessionSummary {
+  root_job_id: string;
+  latest_job_id: string;
+  session_id?: string | null;
+  workdir: string;
+  status: JobStatus | string;
+  created_at: number;
+  updated_at: number;
+  expires_at: number;
+  active_job_id?: string | null;
+  job_count: number;
+  title: string;
+  resumable: boolean;
+  blocked_reason?: string | null;
+}
+
+export interface ChatSessionDetail extends ChatSessionSummary {
+  codex_context: string;
+  jobs: ChatJobRecord[];
+}
+
+export interface ChatSessionsSnapshot {
+  sessions: ChatSessionSummary[];
+  updated_at: number;
 }
 
 type Unlisten = () => void;
@@ -177,6 +240,8 @@ const emptyRuntimeStats: RuntimeStatsSnapshot = {
   failed_jobs: 0,
   cancelled_jobs: 0,
   active_upstream_requests: 0,
+  agent_bridge_active_jobs: 0,
+  agent_bridge_waiting_first_response: 0,
   logs_retained: 0,
   logs_dropped: 0,
   logs_pending: 0,
@@ -192,7 +257,14 @@ const emptyAgentRuntimeStatus: AgentRuntimeStatus = {
   bridge_script: null,
   node_executable: "node",
   active_sessions: 0,
+  active_jobs: 0,
+  waiting_first_response: 0,
   last_error: null,
+};
+
+const emptyChatSessions: ChatSessionsSnapshot = {
+  sessions: [],
+  updated_at: 0,
 };
 
 function toPageNumber(value: number): number {
@@ -259,6 +331,57 @@ export const api = {
     invoke<TokenUsageSnapshot>("get_token_usage", undefined, () => emptyTokenUsage),
   clearTokenUsage: () =>
     invoke<TokenUsageSnapshot>("clear_token_usage", undefined, () => emptyTokenUsage),
+  getChatSessions: () =>
+    invoke<ChatSessionsSnapshot>("get_chat_sessions", undefined, () => emptyChatSessions),
+  getChatSession: (jobId: string, limit?: number) =>
+    invoke<ChatSessionDetail>(
+      "get_chat_session",
+      { jobId, limit },
+      () => ({
+        root_job_id: jobId,
+        latest_job_id: jobId,
+        session_id: null,
+        workdir: "",
+        status: "succeeded",
+        created_at: 0,
+        updated_at: 0,
+        expires_at: 0,
+        active_job_id: null,
+        job_count: 0,
+        title: "本地预览",
+        resumable: false,
+        blocked_reason: "Tauri 运行时不可用",
+        codex_context: "Tauri 运行时不可用",
+        jobs: [],
+      }),
+    ),
+  sendChatMessage: (jobId: string, prompt: string, workdir?: string) =>
+    invoke<JobSummary>(
+      "send_chat_message",
+      { jobId, prompt, workdir },
+      () => ({
+        job_id: "preview-job",
+        root_job_id: jobId,
+        parent_job_id: jobId,
+        session_id: null,
+        resumable: false,
+        expires_at: null,
+        status: "queued",
+        complete: false,
+        cwd: workdir || "",
+        prompt_preview: prompt,
+        created_at: Date.now(),
+        started_at: null,
+        ended_at: null,
+        output_recent: "",
+        output_truncated: false,
+        error: null,
+      }),
+    ),
+  stopChatSession: (jobId: string) =>
+    invoke<ChatSessionsSnapshot>("stop_chat_session", { jobId }, () => emptyChatSessions),
+  deleteChatSession: (jobId: string) =>
+    invoke<ChatSessionsSnapshot>("delete_chat_session", { jobId }, () => emptyChatSessions),
   onLogStatsUpdated: (handler: () => void) =>
     isTauriRuntime()
       ? tauriListen("log-stats-updated", () => handler())
@@ -274,5 +397,9 @@ export const api = {
   onRuntimeStats: (handler: () => void) =>
     isTauriRuntime()
       ? tauriListen("runtime-stats-updated", () => handler())
+      : Promise.resolve<Unlisten>(() => undefined),
+  onChatSessions: (handler: (snapshot: ChatSessionsSnapshot) => void) =>
+    isTauriRuntime()
+      ? tauriListen<ChatSessionsSnapshot>("chat-sessions-updated", (event) => handler(event.payload))
       : Promise.resolve<Unlisten>(() => undefined),
 };

@@ -40,6 +40,10 @@ pub enum JobStatus {
 #[derive(Debug, Clone)]
 struct JobRecord {
     job_id: String,
+    root_job_id: String,
+    parent_job_id: Option<String>,
+    session_id: Option<String>,
+    expires_at: Option<i64>,
     prompt: String,
     cwd: PathBuf,
     created_at: i64,
@@ -66,6 +70,11 @@ pub struct JobStore {
 #[derive(Debug, Clone, Serialize)]
 pub struct JobSummary {
     pub job_id: String,
+    pub root_job_id: String,
+    pub parent_job_id: Option<String>,
+    pub session_id: Option<String>,
+    pub resumable: bool,
+    pub expires_at: Option<i64>,
     pub status: JobStatus,
     pub complete: bool,
     pub cwd: String,
@@ -101,11 +110,75 @@ impl JobStore {
     pub fn start_job(&self, state: AppState, prompt: String, cwd: PathBuf) -> JobSummary {
         self.cleanup_if_needed();
         let job_id = Uuid::new_v4().to_string();
+        let created_at = Utc::now().timestamp_millis();
+        let expires_at = state
+            .sessions()
+            .create_root_job(&job_id, &prompt, &cwd, created_at);
+        self.spawn_job(
+            state,
+            job_id.clone(),
+            job_id.clone(),
+            None,
+            None,
+            Some(expires_at),
+            prompt,
+            cwd,
+            created_at,
+        );
+        self.status(&job_id, 0).expect("fresh job exists")
+    }
+
+    pub fn continue_job(
+        &self,
+        state: AppState,
+        source_job_id: &str,
+        prompt: String,
+        workdir_override: Option<PathBuf>,
+    ) -> Result<JobSummary, String> {
+        self.cleanup_if_needed();
+        let job_id = Uuid::new_v4().to_string();
+        let target = state
+            .sessions()
+            .begin_continuation(source_job_id, &job_id, &prompt, workdir_override)
+            .map_err(|error| error.to_string())?;
+        let created_at = Utc::now().timestamp_millis();
+        self.spawn_job(
+            state,
+            job_id.clone(),
+            target.root_job_id,
+            Some(target.parent_job_id),
+            Some(target.session_id),
+            Some(target.expires_at),
+            prompt,
+            target.workdir,
+            created_at,
+        );
+        self.status(&job_id, 0)
+            .ok_or_else(|| "无法创建续聊任务".to_string())
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn spawn_job(
+        &self,
+        state: AppState,
+        job_id: String,
+        root_job_id: String,
+        parent_job_id: Option<String>,
+        resume_session_id: Option<String>,
+        expires_at: Option<i64>,
+        prompt: String,
+        cwd: PathBuf,
+        created_at: i64,
+    ) {
         let record = Arc::new(Mutex::new(JobRecord {
             job_id: job_id.clone(),
+            root_job_id,
+            parent_job_id,
+            session_id: resume_session_id.clone(),
+            expires_at,
             prompt: prompt.clone(),
             cwd: cwd.clone(),
-            created_at: Utc::now().timestamp_millis(),
+            created_at,
             started_at: None,
             ended_at: None,
             status: JobStatus::Queued,
@@ -138,7 +211,11 @@ impl JobStore {
             {
                 let mut job = record.lock().expect("job poisoned");
                 job.status = JobStatus::Running;
-                job.started_at = Some(Utc::now().timestamp_millis());
+                let started_at = Utc::now().timestamp_millis();
+                job.started_at = Some(started_at);
+                spawned_state
+                    .sessions()
+                    .mark_started(&spawned_job_id, started_at);
             }
             spawned_state.notify_runtime_stats_changed();
             let result = agent_runtime::run_agent(
@@ -147,10 +224,12 @@ impl JobStore {
                 cwd,
                 spawned_job_id.clone(),
                 cancel.clone(),
+                resume_session_id,
             )
             .await;
             let mut job = record.lock().expect("job poisoned");
-            job.ended_at = Some(Utc::now().timestamp_millis());
+            let ended_at = Utc::now().timestamp_millis();
+            job.ended_at = Some(ended_at);
             if cancel.is_cancelled() {
                 job.status = JobStatus::Cancelled;
                 job.error = Some("任务已取消".to_string());
@@ -166,11 +245,23 @@ impl JobStore {
                     }
                 }
             }
+            let status = job.status.clone();
+            let output = if job.status == JobStatus::Succeeded {
+                Some(job.output.clone())
+            } else {
+                None
+            };
+            let error = job.error.clone();
+            spawned_state.sessions().finish_job(
+                &spawned_job_id,
+                &status,
+                output.as_deref(),
+                error.as_deref(),
+                ended_at,
+            );
             notify.notify_waiters();
             spawned_state.notify_runtime_stats_changed();
         });
-
-        self.status(&job_id, 0).expect("fresh job exists")
     }
 
     pub async fn run_with_fast_fallback(
@@ -218,6 +309,13 @@ impl JobStore {
         Some(summary_from_record(&record, recent_chars))
     }
 
+    pub fn set_session_id(&self, job_id: &str, session_id: &str) {
+        if let Some(entry) = self.jobs.get(job_id).map(|entry| entry.clone()) {
+            let mut record = entry.record.lock().expect("job poisoned");
+            record.session_id = Some(session_id.to_string());
+        }
+    }
+
     pub fn result(&self, job_id: &str) -> Option<Value> {
         let summary = self.status(job_id, 0)?;
         let result = if summary.complete {
@@ -241,6 +339,11 @@ impl JobStore {
         };
         Some(json!({
             "job_id": summary.job_id,
+            "root_job_id": summary.root_job_id,
+            "parent_job_id": summary.parent_job_id,
+            "session_id": summary.session_id,
+            "resumable": summary.resumable,
+            "expires_at": summary.expires_at,
             "status": summary.status,
             "complete": summary.complete,
             "cwd": summary.cwd,
@@ -504,6 +607,11 @@ impl JobStore {
         let Some(entry) = self.jobs.get(job_id).map(|entry| entry.clone()) else {
             return json!({
                 "job_id": job_id,
+                "root_job_id": null,
+                "parent_job_id": null,
+                "session_id": null,
+                "resumable": false,
+                "expires_at": null,
                 "status": "not_found",
                 "complete": true,
                 "cwd": null,
@@ -538,6 +646,11 @@ impl JobStore {
 
         json!({
             "job_id": summary.job_id,
+            "root_job_id": summary.root_job_id,
+            "parent_job_id": summary.parent_job_id,
+            "session_id": summary.session_id,
+            "resumable": summary.resumable,
+            "expires_at": summary.expires_at,
             "status": status_label(&summary.status),
             "complete": summary.complete,
             "cwd": summary.cwd,
@@ -610,13 +723,24 @@ impl JobStore {
 }
 
 fn summary_from_record(job: &JobRecord, recent_chars: usize) -> JobSummary {
+    let complete = matches!(
+        job.status,
+        JobStatus::Succeeded | JobStatus::Failed | JobStatus::Cancelled
+    );
     JobSummary {
         job_id: job.job_id.clone(),
+        root_job_id: job.root_job_id.clone(),
+        parent_job_id: job.parent_job_id.clone(),
+        session_id: job.session_id.clone(),
+        resumable: complete
+            && job.session_id.is_some()
+            && job
+                .expires_at
+                .map(|expires_at| expires_at > Utc::now().timestamp_millis())
+                .unwrap_or(false),
+        expires_at: job.expires_at,
         status: job.status.clone(),
-        complete: matches!(
-            job.status,
-            JobStatus::Succeeded | JobStatus::Failed | JobStatus::Cancelled
-        ),
+        complete,
         cwd: job.cwd.display().to_string(),
         prompt_preview: truncate_chars(&job.prompt, PROMPT_PREVIEW_CHARS),
         created_at: job.created_at,
@@ -686,6 +810,10 @@ mod tests {
         let entry = JobEntry {
             record: Arc::new(Mutex::new(JobRecord {
                 job_id: id.to_string(),
+                root_job_id: id.to_string(),
+                parent_job_id: None,
+                session_id: None,
+                expires_at: None,
                 prompt: "test".to_string(),
                 cwd: PathBuf::from("."),
                 created_at: now,

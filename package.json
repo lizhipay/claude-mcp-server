@@ -1,6 +1,6 @@
 {
   "name": "cclaude-mcp",
-  "version": "0.1.9",
+  "version": "0.1.10",
   "private": true,
   "type": "module",
   "scripts": {
@@ -15,7 +15,9 @@
     "@tauri-apps/api": "^2.11.0",
     "lucide-react": "^1.16.0",
     "react": "^19.2.1",
-    "react-dom": "^19.2.1"
+    "react-dom": "^19.2.1",
+    "react-markdown": "^10.1.0",
+    "remark-gfm": "^4.0.1"
   },
   "devDependencies": {
     "@tauri-apps/cli": "^2.11.2",

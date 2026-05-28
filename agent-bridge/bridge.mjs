@@ -11,7 +11,7 @@ const activeJobs = new Map();
 const SDK_VERSION = readSdkVersion();
 const NATIVE_BINARY_PATH = resolveNativeBinaryPath();
 const CLIENT_APP = "claude-mcp/agent-bridge";
-const FIRST_RESPONSE_TIMEOUT_MS = readPositiveIntegerEnv("CLAUDE_MCP_FIRST_RESPONSE_TIMEOUT_MS", 60_000);
+const FIRST_RESPONSE_TIMEOUT_MS = readPositiveIntegerEnv("CLAUDE_MCP_FIRST_RESPONSE_TIMEOUT_MS", 0);
 
 emit({
   type: "ready",
@@ -49,6 +49,7 @@ rl.on("line", (line) => {
       sdk_version: SDK_VERSION,
       native_binary_path: NATIVE_BINARY_PATH,
       active_jobs: activeJobs.size,
+      waiting_first_response: countWaitingFirstResponse(),
       node: process.version,
       platform: process.platform,
       arch: process.arch,
@@ -80,11 +81,14 @@ async function startJob(command) {
   const model = requiredString(command.model, "model");
   const apiKey = requiredString(command.api_key, "api_key");
   const baseUrl = normalizeBaseUrl(requiredString(command.base_url, "base_url"));
+  const resumeSessionId = optionalString(command.resume_session_id);
   const abortController = new AbortController();
   const startedAt = Date.now();
   activeJobs.set(jobId, {
     abortController,
     query: null,
+    startedAt,
+    firstResponseAt: null,
     firstResponseSeen: false,
     firstResponseTimer: null,
     textChars: 0,
@@ -98,7 +102,16 @@ async function startJob(command) {
     type: "started",
     job_id: jobId,
     summary: "Agent SDK 任务已启动",
-    detail: { cwd, model, base_url: baseUrl, permission_mode: "bypassPermissions" },
+    detail: {
+      cwd,
+      model,
+      base_url: baseUrl,
+      permission_mode: "bypassPermissions",
+      resume_session_id: resumeSessionId,
+      active_jobs: activeJobs.size,
+      waiting_first_response: countWaitingFirstResponse(),
+      started_at: startedAt,
+    },
   });
 
   const sessionQuery = query({
@@ -107,6 +120,7 @@ async function startJob(command) {
       abortController,
       cwd,
       model,
+      resume: resumeSessionId || undefined,
       tools: { type: "preset", preset: "claude_code" },
       permissionMode: "bypassPermissions",
       allowDangerouslySkipPermissions: true,
@@ -181,7 +195,7 @@ function handleSdkMessage(jobId, message) {
         type: "usage",
         job_id: jobId,
         usage: message.usage,
-        detail: { model_usage: message.modelUsage },
+        detail: { model_usage: message.modelUsage, ...jobTimingDetail(jobId) },
       });
     }
     if (message.subtype === "success") {
@@ -191,7 +205,7 @@ function handleSdkMessage(jobId, message) {
         output: message.result || "",
         session_id: message.session_id,
         summary: "Agent SDK 任务完成",
-        detail: resultDetail(message),
+        detail: { ...resultDetail(message), ...jobTimingDetail(jobId) },
       });
     } else {
       emit({
@@ -199,7 +213,7 @@ function handleSdkMessage(jobId, message) {
         job_id: jobId,
         error: (message.errors || []).join("\n") || message.subtype || "Agent SDK 执行失败",
         session_id: message.session_id,
-        detail: resultDetail(message),
+        detail: { ...resultDetail(message), ...jobTimingDetail(jobId) },
       });
     }
     finishJob(jobId);
@@ -227,6 +241,7 @@ function handleSdkMessage(jobId, message) {
           text_chars: job.textChars,
           partial_events: job.partialEvents,
           preview: truncate(text, 600),
+          ...jobTimingDetail(jobId),
         },
       });
     }
@@ -242,7 +257,7 @@ function handleSdkMessage(jobId, message) {
       level: "info",
       source: "agent-sdk",
       summary: `Agent SDK 调用工具：${toolNames.join(", ")}`,
-      detail: { tools: toolNames, total_tool_calls: job.toolCalls },
+      detail: { tools: toolNames, total_tool_calls: job.toolCalls, ...jobTimingDetail(jobId) },
     });
   }
 }
@@ -261,6 +276,7 @@ function handleSystemMessage(jobId, message) {
         mcp_servers: message.mcp_servers,
         permission_mode: message.permissionMode,
         claude_code_version: message.claude_code_version,
+        ...jobTimingDetail(jobId),
       },
     });
     return;
@@ -290,7 +306,7 @@ function handleSystemMessage(jobId, message) {
       level: message.status === "failed" ? "warn" : "info",
       source: "agent-sdk",
       summary: message.summary || message.description || `Agent SDK ${message.subtype}`,
-      detail: redactSecrets(message),
+      detail: { ...redactSecrets(message), ...jobTimingDetail(jobId) },
     });
   }
 }
@@ -330,6 +346,7 @@ function finishWithError(jobId, error, options = {}) {
     job_id: jobId,
     summary: options.summary,
     error: error?.stack || error?.message || String(error),
+    detail: jobTimingDetail(jobId),
   });
   finishJob(jobId);
 }
@@ -339,14 +356,20 @@ function armFirstResponseTimeout(jobId) {
   const job = activeJobs.get(jobId);
   if (!job) return;
   job.firstResponseTimer = setTimeout(() => {
-    if (!activeJobs.has(jobId)) return;
-    finishWithError(
-      jobId,
-      new Error(
-        `Agent SDK 上游超过 ${Math.round(FIRST_RESPONSE_TIMEOUT_MS / 1000)} 秒没有返回模型内容，请检查 API 地址、模型名或上游渠道。`
-      ),
-      { abort: true, summary: "Agent SDK 上游长时间无响应" }
-    );
+    const current = activeJobs.get(jobId);
+    if (!current || current.firstResponseSeen) return;
+    emit({
+      type: "log",
+      job_id: jobId,
+      level: "warn",
+      source: "agent-sdk",
+      summary: "Agent SDK 上游首包等待较久",
+      detail: {
+        first_response_warn_ms: FIRST_RESPONSE_TIMEOUT_MS,
+        ...jobTimingDetail(jobId),
+      },
+    });
+    current.firstResponseTimer = null;
   }, FIRST_RESPONSE_TIMEOUT_MS);
   job.firstResponseTimer.unref?.();
 }
@@ -355,6 +378,7 @@ function markFirstResponse(jobId) {
   const job = activeJobs.get(jobId);
   if (!job || job.firstResponseSeen) return;
   job.firstResponseSeen = true;
+  job.firstResponseAt = Date.now();
   if (job.firstResponseTimer) {
     clearTimeout(job.firstResponseTimer);
     job.firstResponseTimer = null;
@@ -365,10 +389,44 @@ function finishJob(jobId) {
   const job = activeJobs.get(jobId);
   if (job?.firstResponseTimer) clearTimeout(job.firstResponseTimer);
   activeJobs.delete(jobId);
+  emit({ type: "status_update", job_id: jobId });
+}
+
+function countWaitingFirstResponse() {
+  let count = 0;
+  for (const job of activeJobs.values()) {
+    if (!job.firstResponseSeen) count += 1;
+  }
+  return count;
+}
+
+function jobTimingDetail(jobId) {
+  const job = activeJobs.get(jobId);
+  if (!job) {
+    return {
+      active_jobs: activeJobs.size,
+      waiting_first_response: countWaitingFirstResponse(),
+    };
+  }
+  const firstResponseWaitMs = job.firstResponseAt
+    ? job.firstResponseAt - job.startedAt
+    : Date.now() - job.startedAt;
+  return {
+    active_jobs: activeJobs.size,
+    waiting_first_response: countWaitingFirstResponse(),
+    started_at: job.startedAt,
+    first_response_at: job.firstResponseAt,
+    first_response_wait_ms: firstResponseWaitMs,
+  };
 }
 
 function emit(event) {
-  process.stdout.write(`${JSON.stringify(event)}\n`);
+  const enriched = {
+    active_jobs: activeJobs.size,
+    waiting_first_response: countWaitingFirstResponse(),
+    ...event,
+  };
+  process.stdout.write(`${JSON.stringify(enriched)}\n`);
 }
 
 function requiredString(value, name) {
@@ -376,6 +434,12 @@ function requiredString(value, name) {
     throw new Error(`缺少参数：${name}`);
   }
   return value;
+}
+
+function optionalString(value) {
+  if (typeof value !== "string") return undefined;
+  const trimmed = value.trim();
+  return trimmed ? trimmed : undefined;
 }
 
 function readPositiveIntegerEnv(name, fallback) {

@@ -270,6 +270,18 @@ mod tests {
             tool_names.contains(&"code_batch_poll".to_string()),
             "tools: {tool_names:?}"
         );
+        assert!(
+            tool_names.contains(&"code_continue_start".to_string()),
+            "tools: {tool_names:?}"
+        );
+        assert!(
+            tool_names.contains(&"code_continue".to_string()),
+            "tools: {tool_names:?}"
+        );
+        assert!(
+            tool_names.contains(&"code_chat_history".to_string()),
+            "tools: {tool_names:?}"
+        );
 
         let call = post_mcp(
             &client,
@@ -329,6 +341,23 @@ mod tests {
             poll["result"]["structuredContent"]["not_found"][0]["job_id"],
             "missing"
         );
+
+        let history = post_mcp(
+            &client,
+            &mcp_url,
+            json!({
+                "jsonrpc": "2.0",
+                "id": 6,
+                "method": "tools/call",
+                "params": {
+                    "name": "code_chat_history",
+                    "arguments": {"job_id": "missing"}
+                }
+            }),
+        )
+        .await;
+        assert_eq!(history["id"], 6);
+        assert_eq!(history["result"]["isError"], true);
 
         state.server().stop(state.clone()).await.unwrap();
     }

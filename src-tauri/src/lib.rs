@@ -7,6 +7,7 @@ mod jobs;
 mod logs;
 mod mcp;
 mod server;
+mod sessions;
 mod state;
 mod token_usage;
 mod tray;
@@ -46,7 +47,12 @@ pub fn run() {
             commands::get_log_detail,
             commands::clear_logs,
             commands::get_token_usage,
-            commands::clear_token_usage
+            commands::clear_token_usage,
+            commands::get_chat_sessions,
+            commands::get_chat_session,
+            commands::send_chat_message,
+            commands::stop_chat_session,
+            commands::delete_chat_session
         ])
         .build(tauri::generate_context!())
         .expect("failed to build Claude MCP");

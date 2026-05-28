@@ -36,6 +36,8 @@ pub struct AgentRuntimeStatus {
     pub bridge_script: Option<String>,
     pub node_executable: String,
     pub active_sessions: usize,
+    pub active_jobs: usize,
+    pub waiting_first_response: usize,
     pub last_error: Option<String>,
 }
 
@@ -53,6 +55,8 @@ struct AgentBridgeInner {
     node_executable: Mutex<String>,
     last_error: Mutex<Option<String>>,
     active_sessions: AtomicUsize,
+    active_jobs: AtomicUsize,
+    waiting_first_response: AtomicUsize,
 }
 
 struct BridgeProcess {
@@ -80,6 +84,7 @@ struct BridgeEvent {
     sdk_version: Option<String>,
     native_binary_path: Option<String>,
     active_jobs: Option<usize>,
+    waiting_first_response: Option<usize>,
     node: Option<String>,
     platform: Option<String>,
     arch: Option<String>,
@@ -97,6 +102,8 @@ impl Default for AgentBridge {
                 node_executable: Mutex::new(node_executable()),
                 last_error: Mutex::new(None),
                 active_sessions: AtomicUsize::new(0),
+                active_jobs: AtomicUsize::new(0),
+                waiting_first_response: AtomicUsize::new(0),
             }),
         }
     }
@@ -111,6 +118,7 @@ impl AgentBridge {
         cwd: PathBuf,
         runtime: SdkRuntimeConfig,
         cancel: CancellationToken,
+        resume_session_id: Option<String>,
     ) -> anyhow::Result<String> {
         self.ensure_started(&state).await?;
         let (tx, rx) = oneshot::channel();
@@ -131,6 +139,7 @@ impl AgentBridge {
                 "api_key": runtime.api_key,
                 "base_url": runtime.base_url,
                 "model": runtime.model,
+                "resume_session_id": resume_session_id,
             }))
             .await;
         if let Err(error) = send_result {
@@ -190,6 +199,8 @@ impl AgentBridge {
                 .expect("node executable poisoned")
                 .clone(),
             active_sessions: self.inner.active_sessions.load(Ordering::Relaxed),
+            active_jobs: self.inner.active_jobs.load(Ordering::Relaxed),
+            waiting_first_response: self.inner.waiting_first_response.load(Ordering::Relaxed),
             last_error: self
                 .inner
                 .last_error
@@ -197,6 +208,14 @@ impl AgentBridge {
                 .expect("last error poisoned")
                 .clone(),
         }
+    }
+
+    pub fn active_jobs(&self) -> usize {
+        self.inner.active_jobs.load(Ordering::Relaxed)
+    }
+
+    pub fn waiting_first_response(&self) -> usize {
+        self.inner.waiting_first_response.load(Ordering::Relaxed)
     }
 
     async fn ensure_started(&self, state: &AppState) -> anyhow::Result<()> {
@@ -320,6 +339,10 @@ impl AgentBridge {
                     fail_all_pending(&wait_inner, "Agent SDK bridge 等待失败");
                 }
             }
+            wait_inner.active_jobs.store(0, Ordering::Relaxed);
+            wait_inner
+                .waiting_first_response
+                .store(0, Ordering::Relaxed);
             *wait_inner.process.lock().await = None;
         });
 
@@ -387,9 +410,18 @@ async fn read_stderr_loop(state: AppState, stderr: tokio::process::ChildStderr) 
 }
 
 fn handle_bridge_event(state: &AppState, inner: &Arc<AgentBridgeInner>, event: BridgeEvent) {
+    let has_runtime_counts = event.active_jobs.is_some() || event.waiting_first_response.is_some();
+    update_bridge_metadata(inner, &event);
+    if has_runtime_counts {
+        state.notify_runtime_stats_changed();
+    }
+
+    if let (Some(job_id), Some(session_id)) = (&event.job_id, &event.session_id) {
+        state.jobs().set_session_id(job_id, session_id);
+        state.sessions().attach_session_id(job_id, session_id);
+    }
     match event.kind.as_str() {
         "ready" | "status_response" => {
-            update_bridge_metadata(inner, &event);
             state.logs().push(
                 LogLevel::Info,
                 "agent-bridge",
@@ -404,12 +436,14 @@ fn handle_bridge_event(state: &AppState, inner: &Arc<AgentBridgeInner>, event: B
                     "sdk_version": event.sdk_version,
                     "native_binary_path": event.native_binary_path,
                     "active_jobs": event.active_jobs,
+                    "waiting_first_response": event.waiting_first_response,
                     "node": event.node,
                     "platform": event.platform,
                     "arch": event.arch
                 })),
             );
         }
+        "status_update" => {}
         "started" | "init" | "log" | "stream_summary" => {
             state.logs().push(
                 parse_level(event.level.as_deref()).unwrap_or(LogLevel::Info),
@@ -544,6 +578,8 @@ fn fail_all_pending(inner: &Arc<AgentBridgeInner>, message: &str) {
     for job_id in job_ids {
         complete_pending(inner, Some(&job_id), Err(anyhow::anyhow!("{}", message)));
     }
+    inner.active_jobs.store(0, Ordering::Relaxed);
+    inner.waiting_first_response.store(0, Ordering::Relaxed);
 }
 
 fn update_bridge_metadata(inner: &Arc<AgentBridgeInner>, event: &BridgeEvent) {
@@ -555,6 +591,14 @@ fn update_bridge_metadata(inner: &Arc<AgentBridgeInner>, event: &BridgeEvent) {
             .native_binary_path
             .lock()
             .expect("native path poisoned") = Some(path.clone());
+    }
+    if let Some(active_jobs) = event.active_jobs {
+        inner.active_jobs.store(active_jobs, Ordering::Relaxed);
+    }
+    if let Some(waiting_first_response) = event.waiting_first_response {
+        inner
+            .waiting_first_response
+            .store(waiting_first_response, Ordering::Relaxed);
     }
 }
 
@@ -768,5 +812,35 @@ mod tests {
         let candidates =
             versioned_node_bins(PathBuf::from("/definitely/not/a/real/nvm/root"), "bin/node");
         assert!(candidates.is_empty());
+    }
+
+    #[test]
+    fn bridge_metadata_tracks_runtime_counts() {
+        let bridge = AgentBridge::default();
+        let event = BridgeEvent {
+            kind: "status_update".to_string(),
+            job_id: None,
+            request_id: None,
+            level: None,
+            source: None,
+            summary: None,
+            detail: None,
+            output: None,
+            error: None,
+            usage: None,
+            session_id: None,
+            sdk_version: None,
+            native_binary_path: None,
+            active_jobs: Some(42),
+            waiting_first_response: Some(7),
+            node: None,
+            platform: None,
+            arch: None,
+        };
+
+        update_bridge_metadata(&bridge.inner, &event);
+
+        assert_eq!(bridge.active_jobs(), 42);
+        assert_eq!(bridge.waiting_first_response(), 7);
     }
 }

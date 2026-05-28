@@ -12,7 +12,7 @@ use tauri::{AppHandle, Emitter};
 
 use crate::{
     agent_bridge::AgentBridge, jobs::JobStore, logs::LogStore, server::ServerController,
-    token_usage::TokenUsageStore,
+    sessions::SessionStore, token_usage::TokenUsageStore,
 };
 
 const RUNTIME_STATS_EVENT: &str = "runtime-stats-updated";
@@ -30,6 +30,7 @@ pub struct AppStateInner {
     pub jobs: JobStore,
     pub server: ServerController,
     pub token_usage: TokenUsageStore,
+    pub sessions: SessionStore,
     pub agent_bridge: AgentBridge,
     pub http: Client,
     pub runtime: RuntimeState,
@@ -44,6 +45,8 @@ pub struct RuntimeStatsSnapshot {
     pub failed_jobs: usize,
     pub cancelled_jobs: usize,
     pub active_upstream_requests: usize,
+    pub agent_bridge_active_jobs: usize,
+    pub agent_bridge_waiting_first_response: usize,
     pub logs_retained: usize,
     pub logs_dropped: usize,
     pub logs_pending: usize,
@@ -79,6 +82,7 @@ impl AppState {
                 jobs: JobStore::default(),
                 server: ServerController::default(),
                 token_usage: TokenUsageStore::default(),
+                sessions: SessionStore::default(),
                 agent_bridge: AgentBridge::default(),
                 http,
                 runtime: RuntimeState::default(),
@@ -100,6 +104,10 @@ impl AppState {
 
     pub fn token_usage(&self) -> &TokenUsageStore {
         &self.inner.token_usage
+    }
+
+    pub fn sessions(&self) -> &SessionStore {
+        &self.inner.sessions
     }
 
     pub fn agent_bridge(&self) -> &AgentBridge {
@@ -141,6 +149,8 @@ impl AppState {
             failed_jobs: job_stats.failed,
             cancelled_jobs: job_stats.cancelled,
             active_upstream_requests: self.active_upstream_requests(),
+            agent_bridge_active_jobs: self.agent_bridge().active_jobs(),
+            agent_bridge_waiting_first_response: self.agent_bridge().waiting_first_response(),
             logs_retained: log_stats.total,
             logs_dropped: log_stats.dropped,
             logs_pending: self.logs().pending_len(),
@@ -156,6 +166,7 @@ impl AppState {
     pub fn set_app_handle(&self, app_handle: AppHandle) {
         self.inner.logs.set_app_handle(app_handle.clone());
         self.inner.token_usage.set_app_handle(app_handle.clone());
+        self.inner.sessions.set_app_handle(app_handle.clone());
         self.inner.runtime.set_app_handle(app_handle);
     }
 }

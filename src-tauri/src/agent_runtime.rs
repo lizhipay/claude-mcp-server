@@ -16,6 +16,7 @@ pub async fn run_agent(
     cwd: PathBuf,
     task_id: String,
     cancel: CancellationToken,
+    resume_session_id: Option<String>,
 ) -> anyhow::Result<String> {
     match config::load_agent_runtime() {
         AgentRuntime::Sdk => {
@@ -30,11 +31,12 @@ pub async fn run_agent(
                     cwd.clone(),
                     runtime,
                     cancel.clone(),
+                    resume_session_id.clone(),
                 )
                 .await;
             match result {
                 Ok(output) => Ok(output),
-                Err(error) if should_fallback_to_legacy(&error) => {
+                Err(error) if resume_session_id.is_none() && should_fallback_to_legacy(&error) => {
                     state.logs().push(
                         LogLevel::Warn,
                         "agent-runtime",
@@ -48,7 +50,12 @@ pub async fn run_agent(
                 Err(error) => Err(error),
             }
         }
-        AgentRuntime::Legacy => claude::run_agent(state, prompt, cwd, task_id, cancel).await,
+        AgentRuntime::Legacy => {
+            if resume_session_id.is_some() {
+                anyhow::bail!("legacy runtime 不支持 Agent SDK session 续聊");
+            }
+            claude::run_agent(state, prompt, cwd, task_id, cancel).await
+        }
     }
 }
 

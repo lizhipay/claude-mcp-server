@@ -83,6 +83,38 @@ pub struct BatchPollRequest {
     pub include_running: Option<bool>,
 }
 
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct ContinueStartRequest {
+    #[schemars(description = "Existing job_id whose Agent SDK session should be resumed.")]
+    pub job_id: String,
+    #[schemars(description = "Follow-up instruction to send into the same Agent SDK session.")]
+    pub prompt: String,
+    #[schemars(
+        description = "Optional working directory override. Defaults to the original session workdir."
+    )]
+    pub workdir: Option<String>,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct ContinueWaitRequest {
+    #[schemars(description = "Existing job_id whose Agent SDK session should be resumed.")]
+    pub job_id: String,
+    #[schemars(description = "Follow-up instruction to send into the same Agent SDK session.")]
+    pub prompt: String,
+    #[schemars(
+        description = "Optional working directory override. Defaults to the original session workdir."
+    )]
+    pub workdir: Option<String>,
+    pub timeout_seconds: Option<u64>,
+    pub recent_chars: Option<usize>,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct ChatHistoryRequest {
+    pub job_id: String,
+    pub limit: Option<usize>,
+}
+
 impl ClaudeMcpService {
     pub fn new(state: AppState) -> Self {
         Self {
@@ -300,6 +332,78 @@ impl ClaudeMcpService {
         CallToolResult::structured(result)
     }
 
+    #[tool(
+        description = "Continue an existing Agent SDK session by job_id and return a new job_id immediately. When the user only gives a job_id or asks to continue a previous task, call code_chat_history first and read codex_context before composing the follow-up prompt."
+    )]
+    async fn code_continue_start(
+        &self,
+        Parameters(req): Parameters<ContinueStartRequest>,
+    ) -> CallToolResult {
+        let workdir = match prepare_optional_continue_workdir(&self.state, req.workdir).await {
+            Ok(workdir) => workdir,
+            Err(error) => return CallToolResult::structured_error(json!({"error": error})),
+        };
+        match self
+            .state
+            .jobs()
+            .continue_job(self.state.clone(), &req.job_id, req.prompt, workdir)
+        {
+            Ok(summary) => structured(summary),
+            Err(error) => CallToolResult::structured_error(json!({
+                "job_id": req.job_id,
+                "error": error
+            })),
+        }
+    }
+
+    #[tool(
+        description = "Continue an existing Agent SDK session by job_id and wait for the new continuation job. When the user only gives a job_id or asks to continue a previous task, call code_chat_history first and read codex_context before composing the follow-up prompt."
+    )]
+    async fn code_continue(
+        &self,
+        Parameters(req): Parameters<ContinueWaitRequest>,
+    ) -> CallToolResult {
+        let workdir = match prepare_optional_continue_workdir(&self.state, req.workdir).await {
+            Ok(workdir) => workdir,
+            Err(error) => return CallToolResult::structured_error(json!({"error": error})),
+        };
+        let summary = match self.state.jobs().continue_job(
+            self.state.clone(),
+            &req.job_id,
+            req.prompt,
+            workdir,
+        ) {
+            Ok(summary) => summary,
+            Err(error) => {
+                return CallToolResult::structured_error(json!({
+                    "job_id": req.job_id,
+                    "error": error
+                }))
+            }
+        };
+        let timeout = wait_duration(req.timeout_seconds);
+        let recent_chars = req.recent_chars.unwrap_or(8_000);
+        let result = self
+            .state
+            .jobs()
+            .wait_batch_for(std::slice::from_ref(&summary.job_id), timeout, recent_chars)
+            .await;
+        CallToolResult::structured(result)
+    }
+
+    #[tool(
+        description = "Return lightweight chat history, codex_context, and resumability for a Claude job session. Use this first before code_continue_start/code_continue so Codex can see the visible history while Claude MCP resumes the hidden Agent SDK session."
+    )]
+    fn code_chat_history(&self, Parameters(req): Parameters<ChatHistoryRequest>) -> CallToolResult {
+        match self.state.sessions().detail(&req.job_id, req.limit) {
+            Some(detail) => structured(detail),
+            None => CallToolResult::structured_error(json!({
+                "job_id": req.job_id,
+                "error": "聊天记录不存在或已被清理"
+            })),
+        }
+    }
+
     #[tool(description = "Cancel a queued or running Claude job.")]
     fn code_cancel(&self, Parameters(req): Parameters<ResultRequest>) -> CallToolResult {
         match self.state.jobs().cancel(&req.job_id) {
@@ -390,7 +494,7 @@ fn workdir_or_current(workdir: Option<String>) -> PathBuf {
         .unwrap_or_else(|| PathBuf::from("."))
 }
 
-async fn prepare_workdir(
+pub(crate) async fn prepare_workdir(
     state: &AppState,
     workdir: Option<String>,
     tool_name: &str,
@@ -436,6 +540,20 @@ async fn prepare_workdir(
             );
             Err(error)
         }
+    }
+}
+
+async fn prepare_optional_continue_workdir(
+    state: &AppState,
+    workdir: Option<String>,
+) -> Result<Option<PathBuf>, String> {
+    match workdir {
+        Some(value) if !value.trim().is_empty() => {
+            prepare_workdir(state, Some(value), "code_continue")
+                .await
+                .map(Some)
+        }
+        _ => Ok(None),
     }
 }
 

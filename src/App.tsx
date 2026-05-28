@@ -1,5 +1,6 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import type { InputHTMLAttributes, ReactNode } from "react";
+import ReactMarkdown from "react-markdown";
 import {
   AlertTriangle,
   Anchor,
@@ -18,6 +19,7 @@ import {
   Info,
   KeyRound,
   LayoutDashboard,
+  MessageSquareText,
   Play,
   RefreshCw,
   Save,
@@ -31,8 +33,12 @@ import {
   Trash2,
   Zap,
 } from "lucide-react";
+import remarkGfm from "remark-gfm";
 import type {
   AppConfig,
+  ChatSessionDetail,
+  ChatSessionsSnapshot,
+  ChatSessionSummary,
   LogEntry,
   LogListEntry,
   LogLevel,
@@ -93,7 +99,7 @@ const filterLabel: Record<LogLevelFilter, string> = {
   error: "Error",
 };
 
-type ActiveTab = "main" | "usage" | "logs";
+type ActiveTab = "main" | "chat" | "usage" | "logs";
 
 const emptyLogStats: LogStats = {
   total: 0,
@@ -122,11 +128,18 @@ const defaultRuntimeStats: RuntimeStatsSnapshot = {
   failed_jobs: 0,
   cancelled_jobs: 0,
   active_upstream_requests: 0,
+  agent_bridge_active_jobs: 0,
+  agent_bridge_waiting_first_response: 0,
   logs_retained: 0,
   logs_dropped: 0,
   logs_pending: 0,
   token_pending: 0,
   token_updated_at: null,
+};
+
+const emptyChatSessions: ChatSessionsSnapshot = {
+  sessions: [],
+  updated_at: 0,
 };
 
 function App() {
@@ -138,6 +151,12 @@ function App() {
   const [logPage, setLogPage] = useState<LogPage>(emptyLogPage);
   const [usage, setUsage] = useState<TokenUsageSnapshot>(defaultUsage);
   const [runtimeStats, setRuntimeStats] = useState<RuntimeStatsSnapshot>(defaultRuntimeStats);
+  const [chatSessions, setChatSessions] = useState<ChatSessionsSnapshot>(emptyChatSessions);
+  const [selectedChatId, setSelectedChatId] = useState("");
+  const [chatDetail, setChatDetail] = useState<ChatSessionDetail | null>(null);
+  const [chatMessage, setChatMessage] = useState("");
+  const [chatBusy, setChatBusy] = useState(false);
+  const [chatLoading, setChatLoading] = useState(false);
   const [activeTab, setActiveTab] = useState<ActiveTab>("main");
   const [level, setLevel] = useState<LogLevelFilter>("all");
   const [isLogHovered, setIsLogHovered] = useState(false);
@@ -175,6 +194,17 @@ function App() {
     setRuntimeStats(await api.getRuntimeStats());
   }, []);
 
+  const refreshChatSessions = useCallback(async () => {
+    const snapshot = await api.getChatSessions();
+    setChatSessions(snapshot);
+    setSelectedChatId((current) => {
+      if (current && snapshot.sessions.some((session) => session.root_job_id === current)) {
+        return current;
+      }
+      return snapshot.sessions[0]?.root_job_id ?? "";
+    });
+  }, []);
+
   const showToast = useCallback((message: string) => {
     setToast(message);
     window.setTimeout(() => setToast(""), 1600);
@@ -185,6 +215,17 @@ function App() {
   }, []);
 
   useEffect(() => {
+    const blockNativeContextMenu = (event: MouseEvent) => {
+      event.preventDefault();
+    };
+    const blockGlobalSelectAll = (event: KeyboardEvent) => {
+      if (event.key.toLowerCase() !== "a" || (!event.metaKey && !event.ctrlKey)) return;
+      const target = event.target as HTMLElement | null;
+      if (target?.closest("input, textarea, [contenteditable='true']")) return;
+      event.preventDefault();
+    };
+    window.addEventListener("contextmenu", blockNativeContextMenu);
+    window.addEventListener("keydown", blockGlobalSelectAll);
     api
       .getConfig()
       .then(setConfig)
@@ -196,6 +237,7 @@ function App() {
     refreshLogStats().catch(handleError);
     refreshUsage().catch(handleError);
     refreshRuntimeStats().catch(handleError);
+    refreshChatSessions().catch(handleError);
 
     const unlistenLogs = api.onLogStatsUpdated(() => {
       refreshLogStats().catch(handleError);
@@ -209,13 +251,25 @@ function App() {
     const unlistenRuntime = api.onRuntimeStats(() => {
       refreshRuntimeStats().catch(handleError);
     });
+    const unlistenChat = api.onChatSessions((snapshot) => {
+      setChatSessions(snapshot);
+      setSelectedChatId((current) => {
+        if (current && snapshot.sessions.some((session) => session.root_job_id === current)) {
+          return current;
+        }
+        return snapshot.sessions[0]?.root_job_id ?? "";
+      });
+    });
     return () => {
+      window.removeEventListener("contextmenu", blockNativeContextMenu);
+      window.removeEventListener("keydown", blockGlobalSelectAll);
       unlistenLogs.then((dispose) => dispose()).catch(() => undefined);
       unlistenUsage.then((dispose) => dispose()).catch(() => undefined);
       unlistenStatus.then((dispose) => dispose()).catch(() => undefined);
       unlistenRuntime.then((dispose) => dispose()).catch(() => undefined);
+      unlistenChat.then((dispose) => dispose()).catch(() => undefined);
     };
-  }, [handleError, refreshLogStats, refreshRuntimeStats, refreshUsage]);
+  }, [handleError, refreshChatSessions, refreshLogStats, refreshRuntimeStats, refreshUsage]);
 
   useEffect(() => {
     if (activeTab !== "logs") return;
@@ -226,6 +280,37 @@ function App() {
     if (activeTab !== "usage") return;
     refreshUsage().catch(handleError);
   }, [activeTab, handleError, refreshUsage]);
+
+  useEffect(() => {
+    if (activeTab !== "chat") return;
+    refreshChatSessions().catch(handleError);
+  }, [activeTab, handleError, refreshChatSessions]);
+
+  useEffect(() => {
+    if (activeTab !== "chat" || !selectedChatId) {
+      if (!selectedChatId) setChatDetail(null);
+      return;
+    }
+    let cancelled = false;
+    setChatLoading(true);
+    api
+      .getChatSession(selectedChatId)
+      .then((detail) => {
+        if (!cancelled) setChatDetail(detail);
+      })
+      .catch((err) => {
+        if (!cancelled) {
+          setChatDetail(null);
+          handleError(err);
+        }
+      })
+      .finally(() => {
+        if (!cancelled) setChatLoading(false);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [activeTab, handleError, selectedChatId, chatSessions.updated_at]);
 
   useEffect(() => {
     if (activeTab !== "logs") return;
@@ -406,6 +491,59 @@ function App() {
     }
   }
 
+  async function sendChatMessage() {
+    const prompt = chatMessage.trim();
+    if (!selectedChatId || !prompt) return;
+    setChatBusy(true);
+    setError("");
+    try {
+      const summary = await api.sendChatMessage(selectedChatId, prompt);
+      setChatMessage("");
+      setSelectedChatId(summary.root_job_id);
+      await refreshChatSessions();
+      setChatDetail(await api.getChatSession(summary.root_job_id));
+      showToast("续聊任务已创建");
+    } catch (err) {
+      handleError(err);
+    } finally {
+      setChatBusy(false);
+    }
+  }
+
+  async function stopChatSession(jobId: string) {
+    setError("");
+    try {
+      const snapshot = await api.stopChatSession(jobId);
+      setChatSessions(snapshot);
+      if (selectedChatId === jobId) {
+        setChatDetail(await api.getChatSession(jobId));
+      }
+      await refreshRuntimeStats();
+      showToast("任务已停止");
+    } catch (err) {
+      handleError(err);
+    }
+  }
+
+  async function deleteChatSession(jobId: string) {
+    setError("");
+    try {
+      const snapshot = await api.deleteChatSession(jobId);
+      setChatSessions(snapshot);
+      setChatDetail(null);
+      setSelectedChatId((current) => {
+        if (current !== jobId && snapshot.sessions.some((session) => session.root_job_id === current)) {
+          return current;
+        }
+        return snapshot.sessions[0]?.root_job_id ?? "";
+      });
+      await refreshRuntimeStats();
+      showToast("任务已删除");
+    } catch (err) {
+      handleError(err);
+    }
+  }
+
   const canCopy = Boolean(status.mcp_url);
 
   return (
@@ -430,7 +568,16 @@ function App() {
             onClick={() => setActiveTab("main")}
           >
             <LayoutDashboard size={15} />
-            主控台
+            主页
+          </button>
+          <button
+            className={activeTab === "chat" ? "active" : ""}
+            role="tab"
+            aria-selected={activeTab === "chat"}
+            onClick={() => setActiveTab("chat")}
+          >
+            <MessageSquareText size={15} />
+            任务
           </button>
           <button
             className={activeTab === "usage" ? "active" : ""}
@@ -439,7 +586,7 @@ function App() {
             onClick={() => setActiveTab("usage")}
           >
             <BarChart3 size={15} />
-            用量统计
+            统计
           </button>
           <button
             className={activeTab === "logs" ? "active" : ""}
@@ -448,14 +595,14 @@ function App() {
             onClick={() => setActiveTab("logs")}
           >
             <ScrollText size={15} />
-            运行日志
+            日志
           </button>
         </nav>
       </header>
 
       <div className="tab-panels">
         {activeTab === "main" ? (
-          <div className="tab-panel main-panel" role="tabpanel" aria-label="主控台">
+          <div className="tab-panel main-panel" role="tabpanel" aria-label="主页">
             <section className="glass-card config-card" aria-label="连接配置">
               <img className="peek-mascot" src={mascotPeek} alt="" />
               <div className="section-heading">
@@ -583,10 +730,24 @@ function App() {
               </aside>
             ) : null}
           </div>
+        ) : activeTab === "chat" ? (
+          <ChatPanel
+            sessions={chatSessions.sessions}
+            selectedId={selectedChatId}
+            detail={chatDetail}
+            message={chatMessage}
+            busy={chatBusy}
+            loading={chatLoading}
+            onSelect={setSelectedChatId}
+            onMessageChange={setChatMessage}
+            onSend={sendChatMessage}
+            onStop={stopChatSession}
+            onDelete={deleteChatSession}
+          />
         ) : activeTab === "usage" ? (
           <UsagePanel usage={usage} busy={busy} onClear={clearTokenUsage} />
         ) : (
-          <section className="glass-card log-panel" role="tabpanel" aria-label="运行日志">
+          <section className="glass-card log-panel" role="tabpanel" aria-label="日志">
             <div className="log-panel-head">
               <div className="section-heading tight">
                 <ScrollText size={21} />
@@ -678,11 +839,13 @@ function App() {
 function RuntimeStatsStrip({ stats }: { stats: RuntimeStatsSnapshot }) {
   const done = stats.succeeded_jobs + stats.failed_jobs + stats.cancelled_jobs;
   const items = [
-    ["运行任务", stats.running_jobs],
-    ["上游请求", stats.active_upstream_requests],
-    ["已完成", done],
-    ["日志待写", stats.logs_pending],
-    ["Token 待写", stats.token_pending],
+    ["任务", stats.running_jobs],
+    ["SDK", stats.agent_bridge_active_jobs],
+    ["等首包", stats.agent_bridge_waiting_first_response],
+    ["请求", stats.active_upstream_requests],
+    ["完成", done],
+    ["日志", stats.logs_pending],
+    ["Token", stats.token_pending],
   ];
   return (
     <div className="runtime-strip" aria-label="运行态统计">
@@ -692,6 +855,222 @@ function RuntimeStatsStrip({ stats }: { stats: RuntimeStatsSnapshot }) {
           <strong>{formatNumber(Number(value))}</strong>
         </span>
       ))}
+    </div>
+  );
+}
+
+function ChatPanel({
+  sessions,
+  selectedId,
+  detail,
+  message,
+  busy,
+  loading,
+  onSelect,
+  onMessageChange,
+  onSend,
+  onStop,
+  onDelete,
+}: {
+  sessions: ChatSessionSummary[];
+  selectedId: string;
+  detail: ChatSessionDetail | null;
+  message: string;
+  busy: boolean;
+  loading: boolean;
+  onSelect: (jobId: string) => void;
+  onMessageChange: (value: string) => void;
+  onSend: () => Promise<void>;
+  onStop: (jobId: string) => Promise<void>;
+  onDelete: (jobId: string) => Promise<void>;
+}) {
+  const panelRef = useRef<HTMLElement | null>(null);
+  const [taskMenu, setTaskMenu] = useState<{
+    x: number;
+    y: number;
+    session: ChatSessionSummary;
+  } | null>(null);
+  const selected = sessions.find((session) => session.root_job_id === selectedId) ?? null;
+  const activeDetail = detail && detail.root_job_id === selectedId ? detail : null;
+  const canSend = Boolean(activeDetail?.resumable && message.trim() && !busy);
+  const canStopSelected = Boolean(taskMenu?.session.active_job_id);
+
+  useEffect(() => {
+    if (!taskMenu) return;
+    const close = () => setTaskMenu(null);
+    const closeOnEscape = (event: KeyboardEvent) => {
+      if (event.key === "Escape") close();
+    };
+    window.addEventListener("click", close);
+    window.addEventListener("blur", close);
+    window.addEventListener("keydown", closeOnEscape);
+    return () => {
+      window.removeEventListener("click", close);
+      window.removeEventListener("blur", close);
+      window.removeEventListener("keydown", closeOnEscape);
+    };
+  }, [taskMenu]);
+
+  return (
+    <section className="glass-card chat-panel" role="tabpanel" aria-label="任务" ref={panelRef}>
+      <div className="chat-panel-head">
+        <div className="section-heading tight">
+          <MessageSquareText size={21} />
+          <div>
+            <h2>任务</h2>
+          </div>
+        </div>
+      </div>
+
+      <div className="chat-layout">
+        <aside className="chat-session-list" aria-label="历史任务">
+          {sessions.length === 0 ? (
+            <div className="chat-empty-list">
+              <FileText size={24} />
+              <span>暂无记录</span>
+            </div>
+          ) : (
+            sessions.map((session) => (
+              <button
+                key={session.root_job_id}
+                className={[
+                  session.root_job_id === selectedId ? "active" : "",
+                  `status-${session.status}`,
+                ]
+                  .filter(Boolean)
+                  .join(" ")}
+                type="button"
+                onClick={() => onSelect(session.root_job_id)}
+                onContextMenu={(event) => {
+                  event.preventDefault();
+                  onSelect(session.root_job_id);
+                  const panelRect = panelRef.current?.getBoundingClientRect();
+                  const menuWidth = 142;
+                  const menuHeight = 92;
+                  const relativeX = panelRect ? event.clientX - panelRect.left : event.clientX;
+                  const relativeY = panelRect ? event.clientY - panelRect.top : event.clientY;
+                  const maxX = panelRect ? panelRect.width - menuWidth - 8 : relativeX;
+                  const maxY = panelRect ? panelRect.height - menuHeight - 8 : relativeY;
+                  setTaskMenu({
+                    x: Math.max(8, Math.min(relativeX, maxX)),
+                    y: Math.max(8, Math.min(relativeY, maxY)),
+                    session,
+                  });
+                }}
+              >
+                <strong>{session.title}</strong>
+                <span>
+                  {statusText(session.status)} · {session.job_count} 轮
+                </span>
+              </button>
+            ))
+          )}
+        </aside>
+        {taskMenu ? (
+          <div
+            className="task-context-menu"
+            style={{ left: taskMenu.x, top: taskMenu.y }}
+            role="menu"
+            onClick={(event) => event.stopPropagation()}
+          >
+            <button
+              type="button"
+              disabled={!canStopSelected}
+              onClick={async () => {
+                const jobId = taskMenu.session.root_job_id;
+                setTaskMenu(null);
+                await onStop(jobId);
+              }}
+            >
+              <Square size={14} />
+              停止任务
+            </button>
+            <button
+              className="danger"
+              type="button"
+              onClick={async () => {
+                const jobId = taskMenu.session.root_job_id;
+                setTaskMenu(null);
+                await onDelete(jobId);
+              }}
+            >
+              <Trash2 size={14} />
+              删除任务
+            </button>
+          </div>
+        ) : null}
+
+        <div className="chat-detail">
+          {!selected ? (
+            <div className="chat-empty-detail">
+              <MessageSquareText size={34} />
+              <p>完成一个任务后，这里会出现可续聊记录</p>
+            </div>
+          ) : loading && !activeDetail ? (
+            <div className="chat-empty-detail">
+              <RefreshCw size={30} />
+              <p>正在读取聊天记录</p>
+            </div>
+          ) : (
+            <>
+              <div className="chat-meta">
+                <div>
+                  <strong>{selected.title}</strong>
+                  <span>{selected.workdir}</span>
+                </div>
+                <StatusPill status={selected.status} />
+              </div>
+              <div className="chat-thread">
+                {(activeDetail?.jobs ?? []).map((job) => (
+                  <article className="chat-turn" key={job.job_id}>
+                    <div className="chat-bubble user">
+                      <small>{formatJobTime(job.created_at)} · {shortJobId(job.job_id)}</small>
+                      <MarkdownMessage content={job.prompt} />
+                    </div>
+                    <div className={`chat-bubble assistant ${job.status}`}>
+                      <small>
+                        Claude · {statusText(job.status)}
+                        {job.ended_at ? ` · ${formatJobTime(job.ended_at)}` : ""}
+                      </small>
+                      <MarkdownMessage content={job.error || job.output || runningText(job.status)} />
+                    </div>
+                  </article>
+                ))}
+              </div>
+              <div className="chat-composer">
+                {activeDetail?.blocked_reason ? (
+                  <span className="chat-blocked">{activeDetail.blocked_reason}</span>
+                ) : null}
+                <div className="chat-composer-box">
+                  <textarea
+                    value={message}
+                    disabled={!activeDetail?.resumable || busy}
+                    placeholder={activeDetail?.resumable ? "继续提出修改要求..." : "当前记录不可续聊"}
+                    onChange={(event) => onMessageChange(event.currentTarget.value)}
+                  />
+                  <button
+                    className="chat-send-button"
+                    type="button"
+                    title="发送续聊"
+                    disabled={!canSend}
+                    onClick={onSend}
+                  >
+                    <ArrowUp size={23} />
+                  </button>
+                </div>
+              </div>
+            </>
+          )}
+        </div>
+      </div>
+    </section>
+  );
+}
+
+function MarkdownMessage({ content }: { content: string }) {
+  return (
+    <div className="chat-markdown">
+      <ReactMarkdown remarkPlugins={[remarkGfm]}>{content}</ReactMarkdown>
     </div>
   );
 }
@@ -748,7 +1127,7 @@ function UsagePanel({
   ];
 
   return (
-    <section className="glass-card usage-panel" role="tabpanel" aria-label="用量统计">
+    <section className="glass-card usage-panel" role="tabpanel" aria-label="统计">
       <div className="usage-head">
         <div className="section-heading tight">
           <BarChart3 size={21} />
@@ -905,6 +1284,50 @@ function LabeledInput({
       </span>
     </label>
   );
+}
+
+function StatusPill({ status }: { status: string }) {
+  return <span className={`status-pill ${status}`}>{statusText(status)}</span>;
+}
+
+function statusText(status: string) {
+  switch (status) {
+    case "queued":
+      return "排队中";
+    case "running":
+      return "运行中";
+    case "succeeded":
+      return "已完成";
+    case "failed":
+      return "失败";
+    case "cancelled":
+      return "已取消";
+    default:
+      return status || "未知";
+  }
+}
+
+function runningText(status: string) {
+  if (status === "queued") return "任务正在排队";
+  if (status === "running") return "任务正在运行";
+  if (status === "cancelled") return "任务已取消";
+  if (status === "failed") return "任务失败，未返回结果";
+  return "暂无回复";
+}
+
+function shortJobId(jobId: string) {
+  return jobId.length > 8 ? jobId.slice(0, 8) : jobId;
+}
+
+function formatJobTime(timestamp: number | null | undefined) {
+  if (!timestamp) return "";
+  return new Date(timestamp).toLocaleString("zh-CN", {
+    month: "2-digit",
+    day: "2-digit",
+    hour: "2-digit",
+    minute: "2-digit",
+    hour12: false,
+  });
 }
 
 function formatNumber(value: number) {

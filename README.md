@@ -12,6 +12,7 @@ http://127.0.0.1:8765/mcp
 
 - 让 Codex 调用一个本地 Claude Agent。
 - 使用 Claude Code 同源的 Agent 能力读写文件、搜索项目、修改代码和执行命令。
+- 通过 `job_id` 找回 Agent SDK session，继续让 Claude 修改上一轮任务的细节。
 - 查看每次 MCP 请求、上游 API 调用、本地工具执行和错误日志。
 - 统计每天的 input、output、cache read、cache write 和 total token。
 
@@ -109,6 +110,7 @@ mcp__claude_mcp__code
 mcp__claude_mcp__code_start
 mcp__claude_mcp__code_status
 mcp__claude_mcp__code_result
+mcp__claude_mcp__code_continue_start
 ```
 
 实际显示名称由 Codex 决定，但工具本体来自 `claude-mcp`。
@@ -131,6 +133,9 @@ Claude MCP 对外提供这些工具：
 | `code_batch_wait` | 一次等待多个任务完成，减少频繁轮询 |
 | `code_batch_result` | 一次读取多个任务结果，不等待 |
 | `code_batch_poll` | 增量读取多个任务的新完成结果 |
+| `code_continue_start` | 按历史 `job_id` 继续同一段 Agent SDK session，立刻返回新的 `job_id` |
+| `code_continue` | 按历史 `job_id` 续聊并等待新任务结果 |
+| `code_chat_history` | 查看一个 `job_id` 所属的轻量聊天记录和是否还能续聊 |
 | `code_cancel` | 取消排队中或运行中的任务 |
 
 推荐用法：
@@ -138,6 +143,7 @@ Claude MCP 对外提供这些工具：
 - 短任务直接用 `code`。
 - 长任务用 `code_start` 启动，再用 `code_wait` 等待结果。
 - 多任务并发用多个 `code_start` 启动；想一次等完用 `code_batch_wait`，想边完成边处理用 `code_batch_poll`。
+- 已完成任务需要继续改细节时，用 `code_continue_start` 或桌面端“任务”页。
 - 不建议让 Codex 每隔几秒反复调用 `code_status`，除非只是临时查看进度。
 
 任务状态包括：
@@ -233,6 +239,42 @@ cancelled
 
 `code_batch_poll` 一次最多接收 500 个 `job_id`，适合几百个并发任务分批读取。
 
+`code_continue_start` 参数：
+
+```json
+{
+  "job_id": "历史 job_id",
+  "prompt": "继续修改：把按钮颜色调浅一点，并保持现有风格",
+  "workdir": "/Users/zoe/Developer/project"
+}
+```
+
+`workdir` 可以不填；不填时会继续使用这段 session 原来的目录。
+
+`code_continue` 参数：
+
+```json
+{
+  "job_id": "历史 job_id",
+  "prompt": "继续修改：补一组测试覆盖这个边界",
+  "timeout_seconds": 180,
+  "recent_chars": 8000
+}
+```
+
+`code_chat_history` 参数：
+
+```json
+{
+  "job_id": "任意历史 job_id",
+  "limit": 20
+}
+```
+
+`code_chat_history` 会返回 `codex_context`。这是给 Codex 看的轻量上下文，包含历史 prompt、Claude 最终回复、任务状态、目录和续聊建议；完整上下文仍由 Agent SDK session 保存，不需要塞进 prompt。
+
+续聊能力依赖 Agent SDK session。默认保留 30 天；如果任务来自 legacy 内核、session 已过期、或同一段 session 还在运行，会返回明确错误。
+
 ## 在 Codex 里怎么用
 
 这个软件最适合的用法是：Codex 做调度和验收，Claude MCP 负责真正写代码、改文件、跑命令。你可以把它当成一个本机 Claude Code Agent，Codex 只需要把任务交给 `claude-mcp`。
@@ -297,6 +339,30 @@ workdir: /Users/zoe/Developer/your-project
 - 用 code_wait 等待结果，timeout_seconds 设置为 300。
 - 不要只给计划，必须让 claude-mcp 实际改文件。
 ```
+
+### 继续上一轮任务
+
+适合 Claude MCP 已经写完代码，但你还想继续让它调细节：
+
+```text
+请使用 claude-mcp 继续上一轮任务。
+
+历史 job_id: 粘贴上一轮返回的 job_id
+
+继续要求：
+1. 保持上一轮上下文和同一个 workdir。
+2. 把页面里的保存按钮改得更醒目。
+3. 不要重构无关代码。
+4. 修改完成后运行上一轮同样的验证命令。
+
+执行方式：
+- 先用 code_chat_history 确认这个 job_id 是否 resumable，并阅读返回的 codex_context。
+- 如果可续聊，用 code_continue_start 创建续聊任务。
+- 用 code_wait 等待新的 job_id 完成。
+- 最终只汇报新增修改和验证结果。
+```
+
+桌面端也可以直接打开“任务”页，选中历史任务后在右侧输入修改要求。
 
 ### 让 Claude MCP 写一个完整页面
 
@@ -400,6 +466,137 @@ workdir: /Users/zoe/Developer/your-project
 5. 每次处理 completed / failed / cancelled / not_found。
 6. 把返回的 next_seen_job_ids 保存为新的 seen_job_ids。
 7. complete=true 后停止读取，合并结果给我。
+```
+
+### 并发修复多个独立问题
+
+适合一个项目里有几处互不影响的小问题，想让 Claude MCP 分头处理：
+
+```text
+请使用 claude-mcp 并发修复下面 4 个问题。
+
+workdir: /Users/zoe/Developer/your-project
+
+任务 1：
+修复设置页保存成功后没有提示的问题。
+
+任务 2：
+修复列表页空状态文案不居中的问题。
+
+任务 3：
+检查移动端导航按钮文字是否溢出，必要时修复。
+
+任务 4：
+补充 README 里的本地启动说明。
+
+执行方式：
+1. 每个任务分别用 code_start 启动。
+2. 每个任务都要求 Claude MCP 只改自己负责的文件，避免互相覆盖。
+3. 用 code_batch_poll 每 3 秒读取新完成结果。
+4. 如果某个任务失败，把失败原因单独用 code_continue_start 继续交给同一个 job 修。
+5. 所有任务结束后，你再检查 git diff，确认没有互相打架。
+```
+
+### 指定文件让 Claude MCP 精准修改
+
+适合你已经知道问题范围，不想让 Agent 在整个项目里乱翻：
+
+```text
+请使用 claude-mcp 的 code_with_context_start 精准修改。
+
+workdir: /Users/zoe/Developer/your-project
+
+files:
+- src/App.tsx
+- src/styles.css
+- src/App.test.ts
+
+任务：
+1. 只围绕这三个文件处理。
+2. 修复弹窗关闭按钮在小屏幕下错位的问题。
+3. 保持现有组件结构，不要重写页面。
+4. 修改完成后运行 npm test 和 npm run build。
+5. 最终返回改动摘要和验证结果。
+
+执行方式：
+- 用 code_with_context_start 启动。
+- 用 code_wait 等待结果，timeout_seconds 设置为 300。
+```
+
+### 测试失败后继续修
+
+适合 Claude MCP 第一次改完后测试没过，让它带着同一段上下文继续修：
+
+```text
+请继续修复这个 Claude MCP 任务。
+
+历史 job_id: 粘贴上一次失败任务的 job_id
+
+失败信息：
+把这里粘贴测试失败的关键报错。
+
+继续要求：
+1. 先用 code_chat_history 读取这个 job 的 codex_context。
+2. 用 code_continue_start 继续同一个 Agent SDK session。
+3. 只修复测试失败相关问题，不要扩大改动范围。
+4. 修完后重新运行失败的测试命令。
+5. 如果测试通过，再运行完整构建命令。
+```
+
+### 让 Claude MCP 做发布前检查
+
+适合发版前让 Claude MCP 帮你做一次只读检查：
+
+```text
+请使用 claude-mcp 做发布前检查，不要修改文件。
+
+workdir: /Users/zoe/Developer/your-project
+
+任务：
+1. 检查 package.json、README、版本号、构建脚本是否一致。
+2. 检查最近 git diff 是否包含明显调试代码、临时文件、无关改动。
+3. 检查是否有应该补充到 README 的使用方式。
+4. 给出发布风险清单，按严重程度排序。
+
+执行方式：
+- 用 code_start 启动。
+- 用 code_wait 等待结果。
+- Codex 收到结果后再决定是否执行发布。
+```
+
+### 让 Claude MCP 写测试
+
+适合功能已经写完，但测试覆盖不够：
+
+```text
+请使用 claude-mcp 给现有功能补测试。
+
+workdir: /Users/zoe/Developer/your-project
+
+任务：
+1. 阅读最近 git diff。
+2. 找出新增或变更的用户行为。
+3. 按项目现有测试风格补充最小必要测试。
+4. 不要为了测试大改业务代码。
+5. 运行对应测试命令。
+6. 最终返回新增测试覆盖了哪些行为。
+```
+
+### 让 Claude MCP 生成迁移说明
+
+适合改了配置、接口、命令或用户使用方式之后：
+
+```text
+请使用 claude-mcp 生成迁移说明。
+
+workdir: /Users/zoe/Developer/your-project
+
+任务：
+1. 阅读 README、CHANGELOG 和最近 git diff。
+2. 总结这次版本对用户有什么变化。
+3. 写一段适合放到 GitHub Release 的说明。
+4. 如果有破坏性变更，单独列出来。
+5. 只修改 CHANGELOG.md；如果没有这个文件，就只返回建议内容，不要新建文件。
 ```
 
 ### 让 Codex 监督 Claude MCP 写完再验收
@@ -561,8 +758,8 @@ cargo test
 推送 `v*` tag 会触发 GitHub Actions，并上传 macOS、Windows、Linux 的 x64 和 ARM64 安装包。
 
 ```bash
-git tag v0.1.2
-git push origin main v0.1.2
+git tag v0.1.10
+git push origin main v0.1.10
 ```
 
 发布工作流文件：
