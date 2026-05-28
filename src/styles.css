@@ -699,6 +699,7 @@ button:disabled {
   grid-template-columns: minmax(174px, 28%) minmax(0, 1fr);
   gap: 12px;
   flex: 1;
+  min-width: 0;
   min-height: 0;
 }
 
@@ -706,6 +707,7 @@ button:disabled {
 .chat-detail,
 .chat-thread,
 .chat-composer {
+  min-width: 0;
   min-height: 0;
 }
 
@@ -938,12 +940,16 @@ button:disabled {
 
 .chat-turn {
   display: grid;
+  grid-template-columns: minmax(0, 1fr);
   gap: 7px;
+  min-width: 0;
 }
 
 .chat-bubble {
+  min-width: 0;
   max-width: 94%;
   padding: 9px 11px;
+  overflow: hidden;
   border-radius: 14px;
   color: #30264b;
   background: rgba(255, 255, 255, 0.78);
@@ -975,13 +981,17 @@ button:disabled {
   font-size: 10px;
   font-weight: 720;
   opacity: 0.72;
+  overflow-wrap: anywhere;
 }
 
 .chat-markdown {
+  min-width: 0;
+  max-width: 100%;
   margin: 0;
   font-size: 12px;
   line-height: 1.45;
   overflow-wrap: anywhere;
+  word-break: break-word;
 }
 
 .chat-markdown > :first-child {
@@ -1001,6 +1011,27 @@ button:disabled {
   margin: 8px 0;
 }
 
+.chat-markdown h1,
+.chat-markdown h2,
+.chat-markdown h3,
+.chat-markdown h4,
+.chat-markdown h5,
+.chat-markdown h6 {
+  margin: 10px 0 7px;
+  color: #2d244c;
+  font-size: 14px;
+  line-height: 1.28;
+  overflow-wrap: anywhere;
+}
+
+.chat-markdown h1 {
+  font-size: 16px;
+}
+
+.chat-markdown h2 {
+  font-size: 15px;
+}
+
 .chat-markdown ul,
 .chat-markdown ol {
   padding-left: 18px;
@@ -1016,6 +1047,9 @@ button:disabled {
   background: rgba(126, 103, 207, 0.13);
   font-family: "JetBrains Mono", "Fira Code", monospace;
   font-size: 0.92em;
+  overflow-wrap: anywhere;
+  white-space: normal;
+  word-break: break-word;
 }
 
 .chat-bubble.user .chat-markdown code {
@@ -1023,6 +1057,7 @@ button:disabled {
 }
 
 .chat-markdown pre {
+  min-width: 0;
   max-width: 100%;
   padding: 10px;
   overflow: auto;
@@ -1035,6 +1070,8 @@ button:disabled {
   padding: 0;
   background: transparent;
   color: inherit;
+  white-space: pre;
+  word-break: normal;
 }
 
 .chat-markdown blockquote {
@@ -1049,16 +1086,27 @@ button:disabled {
 }
 
 .chat-markdown table {
-  width: 100%;
+  display: block;
+  max-width: 100%;
+  overflow: auto;
   border-collapse: collapse;
   font-size: 11px;
 }
 
 .chat-markdown th,
 .chat-markdown td {
+  min-width: 86px;
+  max-width: 260px;
   padding: 5px 6px;
   border: 1px solid rgba(174, 158, 225, 0.34);
   text-align: left;
+  overflow-wrap: anywhere;
+  word-break: break-word;
+}
+
+.chat-markdown img {
+  max-width: 100%;
+  height: auto;
 }
 
 .chat-composer {
