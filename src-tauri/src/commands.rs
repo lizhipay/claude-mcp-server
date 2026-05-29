@@ -3,7 +3,7 @@ use tauri::{AppHandle, State};
 
 use crate::{
     agent_bridge::AgentRuntimeStatus,
-    agent_runtime, claude, config,
+    agent_runtime, config,
     config::{AppConfig, SaveConfigPayload},
     jobs::{JobStatus, JobSummary},
     logs::{LogEntry, LogLevel, LogPage, LogStats},
@@ -25,7 +25,9 @@ pub async fn save_config(payload: SaveConfigPayload) -> Result<AppConfig, String
 
 #[tauri::command]
 pub async fn test_api_connection(state: State<'_, AppState>) -> Result<String, String> {
-    claude::test_connection(&state).await.map_err(to_message)
+    agent_runtime::test_connection(&state)
+        .await
+        .map_err(to_message)
 }
 
 #[tauri::command]

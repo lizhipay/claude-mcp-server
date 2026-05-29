@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { formatTrend } from "./App";
+import { findSelectedChatUpdatedAt, formatTrend } from "./App";
 import { formatLogDetail, getLogCountForLevel, getVirtualLogWindow } from "./log-utils";
 import { maskSecretForDisplay } from "./ui-utils";
 
@@ -62,5 +62,43 @@ describe("usage utilities", () => {
   it("formats daily trend percentages", () => {
     expect(formatTrend(150, 100)).toBe("+50.0%");
     expect(formatTrend(75, 100)).toBe("-25.0%");
+  });
+});
+
+describe("chat utilities", () => {
+  it("tracks only the selected chat update timestamp", () => {
+    const snapshot = {
+      updated_at: 30,
+      sessions: [
+        {
+          root_job_id: "job-1",
+          latest_job_id: "job-1",
+          workdir: "/tmp/a",
+          status: "succeeded",
+          created_at: 1,
+          updated_at: 10,
+          expires_at: 100,
+          job_count: 1,
+          title: "A",
+          resumable: true,
+        },
+        {
+          root_job_id: "job-2",
+          latest_job_id: "job-2",
+          workdir: "/tmp/b",
+          status: "running",
+          created_at: 2,
+          updated_at: 30,
+          expires_at: 100,
+          job_count: 1,
+          title: "B",
+          resumable: false,
+        },
+      ],
+    };
+
+    expect(findSelectedChatUpdatedAt(snapshot, "job-1")).toBe(10);
+    expect(findSelectedChatUpdatedAt({ ...snapshot, updated_at: 40 }, "job-1")).toBe(10);
+    expect(findSelectedChatUpdatedAt(snapshot, "missing")).toBe(0);
   });
 });

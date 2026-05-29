@@ -337,18 +337,24 @@ impl SessionStore {
         Ok(self.snapshot())
     }
 
-    fn cleanup_expired(&self) {
+    fn cleanup_expired(&self) -> bool {
         let now = now_ms();
-        let mut changed = false;
-        self.update(|data| {
-            changed = cleanup_expired_locked(data, now);
-            if changed {
-                data.updated_at = now;
+        let snapshot = {
+            let mut data = self.data.lock().expect("chat sessions poisoned");
+            if !cleanup_expired_locked(&mut data, now) {
+                return false;
             }
-        });
-        if changed {
-            self.emit_snapshot();
-        }
+            data.updated_at = now;
+            let snapshot = data.clone();
+            if let Some(path) = &self.path {
+                if let Err(error) = persist_sessions_file(path, &snapshot) {
+                    eprintln!("failed to persist chat sessions: {error}");
+                }
+            }
+            snapshot
+        };
+        self.emit_snapshot_value(&snapshot);
+        true
     }
 
     fn update_job(

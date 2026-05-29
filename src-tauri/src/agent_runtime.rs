@@ -1,6 +1,7 @@
 use std::path::PathBuf;
 
 use tokio_util::sync::CancellationToken;
+use uuid::Uuid;
 
 use crate::{
     agent_bridge::{AgentRuntimeStatus, SdkRuntimeConfig},
@@ -9,6 +10,51 @@ use crate::{
     logs::LogLevel,
     state::AppState,
 };
+
+pub async fn test_connection(state: &AppState) -> anyhow::Result<String> {
+    match config::load_agent_runtime() {
+        AgentRuntime::Sdk => {
+            let runtime = load_sdk_runtime_config()?;
+            let request_id = Uuid::new_v4().to_string();
+            let cwd = std::env::current_dir().unwrap_or_else(|_| std::env::temp_dir());
+            state.logs().push(
+                LogLevel::Info,
+                "agent-sdk",
+                Some(request_id),
+                None,
+                "开始测试 Claude Code 连接",
+                Some(serde_json::json!({
+                    "base_url": runtime.base_url,
+                    "model": runtime.model,
+                    "cwd": cwd
+                })),
+            );
+            let _upstream_guard = state.begin_upstream_request();
+            let output = state
+                .agent_bridge()
+                .run_job(
+                    state.clone(),
+                    format!("connection-test-{}", Uuid::new_v4()),
+                    "Reply with exactly: OK".to_string(),
+                    cwd,
+                    runtime,
+                    CancellationToken::new(),
+                    None,
+                )
+                .await?;
+            state.logs().push(
+                LogLevel::Info,
+                "agent-sdk",
+                None,
+                None,
+                "Claude Code 连接成功",
+                Some(serde_json::json!({"output": output})),
+            );
+            Ok("连接成功".to_string())
+        }
+        AgentRuntime::Legacy => claude::test_connection(state).await,
+    }
+}
 
 pub async fn run_agent(
     state: AppState,

@@ -142,6 +142,11 @@ const emptyChatSessions: ChatSessionsSnapshot = {
   updated_at: 0,
 };
 
+export function findSelectedChatUpdatedAt(snapshot: ChatSessionsSnapshot, selectedId: string) {
+  if (!selectedId) return 0;
+  return snapshot.sessions.find((session) => session.root_job_id === selectedId)?.updated_at ?? 0;
+}
+
 function App() {
   const [config, setConfig] = useState<AppConfig>(defaultConfig);
   const [apiKey, setApiKey] = useState("");
@@ -171,6 +176,10 @@ function App() {
   const [logDetailLoading, setLogDetailLoading] = useState(false);
   const [logDetailError, setLogDetailError] = useState("");
   const logListRef = useRef<HTMLDivElement | null>(null);
+  const selectedChatUpdatedAt = useMemo(
+    () => findSelectedChatUpdatedAt(chatSessions, selectedChatId),
+    [chatSessions, selectedChatId],
+  );
 
   const activeLogTotal = getLogCountForLevel(logStats, level);
   const logWindow = useMemo(
@@ -310,7 +319,7 @@ function App() {
     return () => {
       cancelled = true;
     };
-  }, [activeTab, handleError, selectedChatId, chatSessions.updated_at]);
+  }, [activeTab, handleError, selectedChatId, selectedChatUpdatedAt]);
 
   useEffect(() => {
     if (activeTab !== "logs") return;
