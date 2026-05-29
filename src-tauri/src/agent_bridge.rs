@@ -1,3 +1,6 @@
+#[cfg(windows)]
+use std::os::windows::process::CommandExt as _;
+
 use std::{
     env, fs,
     path::{Path, PathBuf},
@@ -19,6 +22,9 @@ use tokio::{
 use tokio_util::sync::CancellationToken;
 
 use crate::{claude, logs::LogLevel, state::AppState};
+
+#[cfg(windows)]
+const CREATE_NO_WINDOW: u32 = 0x08000000;
 
 #[derive(Debug, Clone)]
 pub struct SdkRuntimeConfig {
@@ -239,6 +245,7 @@ impl AgentBridge {
             .expect("node executable poisoned") = node.clone();
 
         let mut command = Command::new(&bridge_path);
+        apply_no_window_to_tokio_command(&mut command);
         command
             .arg(&script)
             .current_dir(
@@ -747,7 +754,9 @@ fn node_candidate_is_usable(path: &Path) -> bool {
     if path.components().count() > 1 && !path.exists() {
         return false;
     }
-    let Ok(output) = StdCommand::new(path).arg("--version").output() else {
+    let mut command = StdCommand::new(path);
+    apply_no_window_to_std_command(&mut command);
+    let Ok(output) = command.arg("--version").output() else {
         return false;
     };
     if !output.status.success() {
@@ -756,6 +765,22 @@ fn node_candidate_is_usable(path: &Path) -> bool {
     let version = String::from_utf8_lossy(&output.stdout);
     parse_node_major_version(&version).is_some_and(|major| major >= 18)
 }
+
+#[cfg(windows)]
+fn apply_no_window_to_tokio_command(command: &mut Command) {
+    command.creation_flags(CREATE_NO_WINDOW);
+}
+
+#[cfg(not(windows))]
+fn apply_no_window_to_tokio_command(_command: &mut Command) {}
+
+#[cfg(windows)]
+fn apply_no_window_to_std_command(command: &mut StdCommand) {
+    command.creation_flags(CREATE_NO_WINDOW);
+}
+
+#[cfg(not(windows))]
+fn apply_no_window_to_std_command(_command: &mut StdCommand) {}
 
 fn parse_node_major_version(version: &str) -> Option<u64> {
     version

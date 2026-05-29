@@ -3,14 +3,13 @@
 import fs from "node:fs";
 import path from "node:path";
 import readline from "node:readline";
+import { spawn } from "node:child_process";
 import { createRequire } from "node:module";
-import { query } from "@anthropic-ai/claude-agent-sdk";
 
 const require = createRequire(import.meta.url);
 const activeJobs = new Map();
 const SDK_VERSION = readSdkVersion();
 const NATIVE_BINARY_PATH = resolveNativeBinaryPath();
-const CLIENT_APP = "claude-mcp/agent-bridge";
 const FIRST_RESPONSE_TIMEOUT_MS = readPositiveIntegerEnv("CLAUDE_MCP_FIRST_RESPONSE_TIMEOUT_MS", 0);
 
 emit({
@@ -82,11 +81,14 @@ async function startJob(command) {
   const apiKey = requiredString(command.api_key, "api_key");
   const baseUrl = normalizeBaseUrl(requiredString(command.base_url, "base_url"));
   const resumeSessionId = optionalString(command.resume_session_id);
+  if (!NATIVE_BINARY_PATH) {
+    throw new Error("找不到 Claude Code native binary，请重新安装 @anthropic-ai/claude-agent-sdk optional dependency");
+  }
   const abortController = new AbortController();
   const startedAt = Date.now();
   activeJobs.set(jobId, {
     abortController,
-    query: null,
+    child: null,
     startedAt,
     firstResponseAt: null,
     firstResponseSeen: false,
@@ -101,7 +103,7 @@ async function startJob(command) {
   emit({
     type: "started",
     job_id: jobId,
-    summary: "Agent SDK 任务已启动",
+    summary: "Claude Code 任务已启动",
     detail: {
       cwd,
       model,
@@ -114,74 +116,116 @@ async function startJob(command) {
     },
   });
 
-  const sessionQuery = query({
-    prompt,
-    options: {
-      abortController,
+  const child = spawn(NATIVE_BINARY_PATH, buildClaudeArgs(model, resumeSessionId), {
       cwd,
-      model,
-      resume: resumeSessionId || undefined,
-      tools: { type: "preset", preset: "claude_code" },
-      permissionMode: "bypassPermissions",
-      allowDangerouslySkipPermissions: true,
-      includePartialMessages: true,
-      includeHookEvents: true,
-      forwardSubagentText: false,
-      agentProgressSummaries: true,
-      persistSession: true,
-      settingSources: ["project", "local"],
-      pathToClaudeCodeExecutable: NATIVE_BINARY_PATH || undefined,
-      systemPrompt: {
-        type: "preset",
-        preset: "claude_code",
-        append:
-          "You are running inside Claude MCP. Treat cwd as the project root. Prefer bounded searches, avoid generated directories, and return a concise verified summary.",
-      },
       env: {
         ...process.env,
         ANTHROPIC_API_KEY: apiKey,
         ANTHROPIC_BASE_URL: baseUrl,
-        CLAUDE_AGENT_SDK_CLIENT_APP: CLIENT_APP,
       },
-      stderr: (data) => {
-        const text = String(data || "").trim();
-        if (text) {
-          emit({
-            type: "log",
-            job_id: jobId,
-            level: "debug",
-            source: "agent-sdk",
-            summary: "Agent SDK stderr",
-            detail: { stderr: truncate(text, 4000) },
-          });
-        }
-      },
-    },
+      stdio: ["pipe", "pipe", "pipe"],
+      windowsHide: true,
   });
 
-  activeJobs.get(jobId).query = sessionQuery;
+  const job = activeJobs.get(jobId);
+  if (!job) {
+    child.kill();
+    return;
+  }
+  job.child = child;
 
-  try {
-    for await (const message of sessionQuery) {
-      handleSdkMessage(jobId, message);
-    }
-    if (activeJobs.has(jobId)) {
-      finishWithError(jobId, new Error("Agent SDK 结束时没有返回 result"));
-    }
-  } catch (error) {
+  child.once("error", (error) => {
+    if (!activeJobs.has(jobId)) return;
+    finishWithError(jobId, error);
+  });
+
+  child.once("close", (code, signal) => {
     if (!activeJobs.has(jobId)) return;
     if (abortController.signal.aborted) {
       emit({
         type: "cancelled",
         job_id: jobId,
         error: "任务已取消",
-        detail: { elapsed_ms: Date.now() - startedAt },
+        detail: { elapsed_ms: Date.now() - startedAt, exit_code: code, signal },
       });
       finishJob(jobId);
       return;
     }
-    finishWithError(jobId, error);
+    finishWithError(
+      jobId,
+      new Error(`Claude Code 进程退出时没有返回 result（exit_code=${code}, signal=${signal || ""}）`)
+    );
+  });
+
+  child.stderr.setEncoding("utf8");
+  child.stderr.on("data", (data) => {
+    const text = String(data || "").trim();
+    if (text) {
+      emit({
+        type: "log",
+        job_id: jobId,
+        level: "debug",
+        source: "agent-sdk",
+        summary: "Claude Code stderr",
+        detail: { stderr: truncate(text, 4000) },
+      });
+    }
+  });
+
+  const childLines = readline.createInterface({
+    input: child.stdout,
+    crlfDelay: Infinity,
+  });
+  childLines.on("line", (line) => {
+    const trimmed = line.trim();
+    if (!trimmed) return;
+    try {
+      handleSdkMessage(jobId, JSON.parse(trimmed));
+    } catch (error) {
+      emit({
+        type: "log",
+        job_id: jobId,
+        level: "warn",
+        source: "agent-sdk",
+        summary: "Claude Code 输出无法解析",
+        detail: { error: String(error), line: truncate(trimmed, 4000) },
+      });
+    }
+  });
+
+  abortController.signal.addEventListener("abort", () => {
+    if (!child.killed) child.kill();
+  });
+
+  try {
+    child.stdin.end(prompt);
+  } catch (error) {
+    finishWithError(jobId, error, { abort: true });
   }
+}
+
+function buildClaudeArgs(model, resumeSessionId) {
+  const args = [
+    "-p",
+    "--verbose",
+    "--output-format",
+    "stream-json",
+    "--include-partial-messages",
+    "--include-hook-events",
+    "--model",
+    model,
+    "--permission-mode",
+    "bypassPermissions",
+    "--dangerously-skip-permissions",
+    "--setting-sources",
+    "project,local",
+    "--append-system-prompt",
+    "You are running inside Claude MCP. Treat cwd as the project root. Prefer bounded searches, avoid generated directories, and return a concise verified summary.",
+  ];
+  if (resumeSessionId) {
+    args.push("--resume", resumeSessionId);
+  }
+  return args;
 }
 
 function handleSdkMessage(jobId, message) {
@@ -198,7 +242,7 @@ function handleSdkMessage(jobId, message) {
         detail: { model_usage: message.modelUsage, ...jobTimingDetail(jobId) },
       });
     }
-    if (message.subtype === "success") {
+    if (message.subtype === "success" && !message.is_error && !message.api_error_status) {
       emit({
         type: "done",
         job_id: jobId,
@@ -211,7 +255,11 @@ function handleSdkMessage(jobId, message) {
       emit({
         type: "error",
         job_id: jobId,
-        error: (message.errors || []).join("\n") || message.subtype || "Agent SDK 执行失败",
+        error:
+          message.result ||
+          (message.errors || []).join("\n") ||
+          message.subtype ||
+          "Agent SDK 执行失败",
         session_id: message.session_id,
         detail: { ...resultDetail(message), ...jobTimingDetail(jobId) },
       });
@@ -318,9 +366,7 @@ function cancelJob(jobId) {
     return;
   }
   job.abortController.abort();
-  if (job.query && typeof job.query.close === "function") {
-    job.query.close();
-  }
+  if (job.child && !job.child.killed) job.child.kill();
   emit({
     type: "cancelled",
     job_id: jobId,
@@ -337,9 +383,7 @@ function finishWithError(jobId, error, options = {}) {
   const job = activeJobs.get(jobId);
   if (job && options.abort) {
     job.abortController.abort();
-    if (job.query && typeof job.query.close === "function") {
-      job.query.close();
-    }
+    if (job.child && !job.child.killed) job.child.kill();
   }
   emit({
     type: "error",
